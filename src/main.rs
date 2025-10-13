@@ -243,18 +243,44 @@ fn main() -> Result<std::process::ExitCode> {
         
         // Apply automatic timestamp resolutions
         for (uuid, strategy) in &auto_resolved {
-            if let (Some(_dest_entry), Some(source_entry)) = (
-                find_entry_by_uuid(&destination_db.root, uuid),
-                find_entry_by_uuid(&source_db.root, uuid)
-            ) {
+            let dest_entry = find_entry_by_uuid(&destination_db.root, &uuid).cloned();
+            let source_entry = find_entry_by_uuid(&source_db.root, &uuid).cloned();
+            
+            if let (Some(dest_entry), Some(source_entry)) = (dest_entry, source_entry) {
                 match *strategy {
                     "prefer-destination" => {
+                        // Add source entry to destination entry's history
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            // Store the source entry in a custom history field
+                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
+                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
+                                if !hist_str.is_empty() {
+                                    hist_str.push('\n');
+                                }
+                                hist_str.push_str(&format!("Source entry merged at {}: Title={:?}, UserName={:?}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                                    source_entry.fields.get("Title"),
+                                    source_entry.fields.get("UserName")));
+                            }
+                        }
                         println!("Entry {} resolved by timestamp: keeping destination version", uuid);
                     }
                     "prefer-source" => {
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            // Add old destination entry to history before replacing
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
+                            // Store the old destination entry in history
+                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
+                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
+                                if !hist_str.is_empty() {
+                                    hist_str.push('\n');
+                                }
+                                hist_str.push_str(&format!("Destination entry replaced at {}: Title={:?}, UserName={:?}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                                    dest_entry.fields.get("Title"),
+                                    dest_entry.fields.get("UserName")));
+                            }
                             println!("Entry {} resolved by timestamp: replaced with source version", uuid);
                         }
                     }
@@ -356,13 +382,13 @@ fn main() -> Result<std::process::ExitCode> {
         }
 
         for uuid in &conflicting_uuids {
-            if let (Some(dest_entry), Some(source_entry)) = (
-                find_entry_by_uuid(&destination_db.root, uuid),
-                find_entry_by_uuid(&source_db.root, uuid)
-            ) {
+            let dest_entry = find_entry_by_uuid(&destination_db.root, uuid).cloned();
+            let source_entry = find_entry_by_uuid(&source_db.root, uuid).cloned();
+            
+            if let (Some(dest_entry), Some(source_entry)) = (dest_entry, source_entry) {
                 // First, try to resolve by timestamp if not ignoring threshold
                 let effective_strategy = if !args.ignore_threshold {
-                    if let Some(timestamp_strategy) = resolve_conflict_by_timestamp(dest_entry, source_entry, threshold_seconds) {
+                    if let Some(timestamp_strategy) = resolve_conflict_by_timestamp(&dest_entry, &source_entry, threshold_seconds) {
                         println!("Entry {} resolved by timestamp comparison: {}", uuid, timestamp_strategy);
                         timestamp_strategy
                     } else {
@@ -374,15 +400,39 @@ fn main() -> Result<std::process::ExitCode> {
 
                 match effective_strategy {
                     "prefer-destination" => {
-                        // Destination entry is already kept by merge, source is ignored
+                        // Add source entry to destination entry's history
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            // Store the source entry in a custom history field
+                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
+                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
+                                if !hist_str.is_empty() {
+                                    hist_str.push('\n');
+                                }
+                                hist_str.push_str(&format!("Source entry merged at {}: Title={:?}, UserName={:?}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                                    source_entry.fields.get("Title"),
+                                    source_entry.fields.get("UserName")));
+                            }
+                        }
                         println!("Keeping destination version for entry {}", uuid);
                     }
                     "prefer-source" => {
                         // Replace destination entry with source entry
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
-                            // Copy source entry data to destination entry
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            // Add old destination entry to history before replacing
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
+                            // Store the old destination entry in history
+                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
+                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
+                                if !hist_str.is_empty() {
+                                    hist_str.push('\n');
+                                }
+                                hist_str.push_str(&format!("Destination entry replaced at {}: Title={:?}, UserName={:?}",
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                                    dest_entry.fields.get("Title"),
+                                    dest_entry.fields.get("UserName")));
+                            }
                             // Keep the same UUID and other metadata
                             println!("Replaced destination entry {} with source version", uuid);
                         }
