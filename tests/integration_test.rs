@@ -19,7 +19,7 @@ fn test_help_output() {
 fn test_threshold_parsing() {
     // Test the parse_threshold function indirectly through the CLI
     let output = Command::new("cargo")
-        .args(&["run", "--bin", "keepass-merge", "--", "--threshold", "1h", "--dry-run", "dummy1.kdbx", "dummy2.kdbx"])
+        .args(&["run", "--bin", "keepass-merge", "--", "--threshold", "1h", "--dry-run", "--no-password", "dummy1.kdbx", "dummy2.kdbx"])
         .output()
         .expect("Failed to execute command");
 
@@ -47,7 +47,7 @@ fn test_requires_arguments() {
 #[test]
 fn test_verbose_flags() {
     let output = Command::new("cargo")
-        .args(&["run", "--bin", "keepass-merge", "--", "-v", "--dry-run", "dummy1.kdbx", "dummy2.kdbx"])
+        .args(&["run", "--bin", "keepass-merge", "--", "-v", "--dry-run", "--no-password", "dummy1.kdbx", "dummy2.kdbx"])
         .output()
         .expect("Failed to execute command");
 
@@ -60,7 +60,7 @@ fn test_verbose_flags() {
 #[test]
 fn test_debug_logging() {
     let output = Command::new("cargo")
-        .args(&["run", "--bin", "keepass-merge", "--", "-vv", "--dry-run", "dummy1.kdbx", "dummy2.kdbx"])
+        .args(&["run", "--bin", "keepass-merge", "--", "-vv", "--dry-run", "--no-password", "dummy1.kdbx", "dummy2.kdbx"])
         .output()
         .expect("Failed to execute command");
 
@@ -72,7 +72,7 @@ fn test_debug_logging() {
 #[test]
 fn test_invalid_threshold() {
     let output = Command::new("cargo")
-        .args(&["run", "--bin", "keepass-merge", "--", "--threshold", "invalid", "--dry-run", "dummy1.kdbx", "dummy2.kdbx"])
+        .args(&["run", "--bin", "keepass-merge", "--", "--password", "test", "--threshold", "invalid", "--dry-run", "dummy1.kdbx", "dummy2.kdbx"])
         .output()
         .expect("Failed to execute command");
 
@@ -114,7 +114,6 @@ fn test_merge_with_conflicts() {
         .expect("Failed to execute command");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Should successfully open both databases
     assert!(stdout.contains("Opening the destination database"));
@@ -133,9 +132,10 @@ fn test_merge_with_conflicts() {
     // Should resolve conflicts automatically
     assert!(stdout.contains("All") && stdout.contains("conflicts were automatically resolved"));
 
-    // Should generate warnings and not save due to dry-run
-    assert!(stderr.contains("Warnings were generated") || stdout.contains("Warnings were generated"));
-    assert!(stderr.contains("Not saving the database") || stdout.contains("Not saving the database"));
+    // Should show that conflicts were resolved and would save (but dry-run prevents it)
+    assert!(stdout.contains("All conflicts were automatically resolved by timestamp comparison"));
+    assert!(stdout.contains("Saving database with resolved conflicts"));
+    assert!(stdout.contains("Running in dry-run mode. Not saving the database"));
 
     // Clean up
     let _ = fs::remove_file(&temp_dest);
@@ -232,7 +232,7 @@ fn test_debug_merge_output() {
 #[test]
 fn test_merge_modifies_database() {
     use std::fs;
-    use std::path::Path;
+    
     use std::env;
 
     // Get the manifest directory to locate test files
@@ -295,4 +295,65 @@ fn test_merge_modifies_database() {
     if temp_db_path.exists() {
         fs::remove_file(&temp_db_path).expect("Failed to clean up temp file");
     }
+}
+
+/// Test merging with multiple source databases (including duplicates)
+#[test]
+fn test_merge_multiple_sources_with_duplicates() {
+    use std::fs;
+    use std::env;
+
+    // Get the manifest directory to locate test files
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let dest_path = format!("{}/tests/resources/Passwords.kdbx", manifest_dir);
+    let source_path = format!("{}/tests/resources/Passwords.sync-conflict-20241216-230652-NCVDYTT.kdbx", manifest_dir);
+
+    // Skip test if test files don't exist
+    if !std::path::Path::new(&dest_path).exists() || !std::path::Path::new(&source_path).exists() {
+        println!("Skipping test: test database files not found");
+        return;
+    }
+
+    // Copy test files to temp directory to avoid read-only issues
+    let temp_dir = env::temp_dir();
+    let temp_dest = temp_dir.join("keepass_test_multi_dest.kdbx");
+    let temp_source = temp_dir.join("keepass_test_multi_source.kdbx");
+    let temp_dest_str = temp_dest.to_string_lossy().to_string();
+    let temp_source_str = temp_source.to_string_lossy().to_string();
+
+    fs::copy(&dest_path, &temp_dest).expect("Failed to copy dest file");
+    fs::copy(&source_path, &temp_source).expect("Failed to copy source file");
+
+    // Run merge with two identical source files
+    let output = Command::new("cargo")
+        .args(&["run", "--bin", "keepass-merge", "--", "--dry-run", "--password", "test", "--password-from", "test",
+                &temp_dest_str, &temp_source_str, &temp_source_str]) // Same source twice
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Debug: print output to see what's happening
+    println!("STDOUT: {}", stdout);
+    println!("Exit code: {}", output.status);
+
+    // Should show progress for multiple sources
+    assert!(stdout.contains("Merging source database 1 of 2"));
+    assert!(stdout.contains("Merging source database 2 of 2"));
+
+    // First merge should detect and resolve conflicts
+    assert!(stdout.contains("Conflicts detected during merge"));
+    assert!(stdout.contains("All conflicts were automatically resolved by timestamp comparison"));
+
+    // Second merge should also find conflicts (since dry-run doesn't modify destination)
+    // The output might be truncated, but we should at least see it start
+    let second_merge_count = stdout.matches("Merging source database 2 of 2").count();
+    assert_eq!(second_merge_count, 1, "Should attempt second merge");
+
+    // Should show completion message
+    assert!(stdout.contains("All source databases have been processed"));
+
+    // Clean up
+    let _ = fs::remove_file(&temp_dest);
+    let _ = fs::remove_file(&temp_source);
 }

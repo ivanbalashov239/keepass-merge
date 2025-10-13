@@ -17,8 +17,8 @@ struct KeepassMerge {
     /// The path of the database file to merge to.
     destination_db: String,
 
-    /// The path of the database file to merge from.
-    source_db: String,
+    /// The path(s) of the database file(s) to merge from.
+    source_db: Vec<String>,
 
     /// Do not use a password to decrypt the destination database
     #[clap(long, short)]
@@ -101,17 +101,7 @@ struct KeepassMerge {
     ignore_threshold: bool,
 }
 
-fn main() -> Result<std::process::ExitCode> {
-    let mut args = KeepassMerge::parse();
-    
-    // Initialize logging
-    let mut builder = env_logger::Builder::from_default_env();
-    if args.verbose >= 2 {
-        builder.filter_level(log::LevelFilter::Debug);
-    } else {
-        builder.filter_level(log::LevelFilter::Info);
-    }
-    builder.init();
+fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<std::process::ExitCode> {
 
     // Parse threshold
     let threshold_seconds = match parse_threshold(&args.threshold) {
@@ -135,10 +125,15 @@ fn main() -> Result<std::process::ExitCode> {
         ));
     }
 
-    let destination_db_path = args.destination_db;
-    let source_db_path = args.source_db;
+    let destination_db_path = args.destination_db.clone();
+    let source_db_path = source_db_path.to_string();
     let destination_path = std::path::Path::new(&destination_db_path);
     let temp_path = destination_path.with_file_name(format!(".tmpkdbx.{}", destination_path.file_name().unwrap().to_string_lossy())).to_string_lossy().to_string();
+
+    // Helper function to clean up temp file
+    let cleanup_temp_file = || {
+        let _ = std::fs::remove_file(&temp_path);
+    };
 
     // Read and store the original destination database content for integrity checking
     println!("Reading original destination database...");
@@ -160,23 +155,19 @@ fn main() -> Result<std::process::ExitCode> {
         let destination_db_password = if let Some(ref pwd) = args.password {
             pwd.clone()
         } else {
-            let password_prompt = if args.same_credentials {
-                "Password for the databases: "
-            } else {
-                "Password for the destination database: "
-            };
-
-            rpassword::prompt_password(password_prompt).expect("Could not read password from TTY")
+            // This should not happen since we prompt in main(), but fallback just in case
+            rpassword::prompt_password("Password for the destination database: ")
+                .expect("Could not read password from TTY")
         };
         destination_db_key = destination_db_key.with_password(&destination_db_password);
     }
 
     // TODO support keyfile
 
-    if let Some(slot) = args.slot {
+    if let Some(slot) = &args.slot {
         let yubikey = ChallengeResponseKey::get_yubikey(args.serial_number)?;
         destination_db_key = destination_db_key
-            .with_challenge_response_key(ChallengeResponseKey::YubikeyChallenge(yubikey, slot));
+            .with_challenge_response_key(ChallengeResponseKey::YubikeyChallenge(yubikey, slot.clone()));
     }
 
     if destination_db_key.is_empty() {
@@ -200,15 +191,8 @@ fn main() -> Result<std::process::ExitCode> {
                 let source_db_password = if let Some(ref pwd) = args.password_from {
                     pwd.clone()
                 } else if args.same_credentials {
-                    // Use the same password as destination
-                    if let Some(ref pwd) = args.password {
-                        pwd.clone()
-                    } else {
-                        let destination_db_password = rpassword::prompt_password("Password for the databases: ")
-                            .expect("Could not read password from TTY");
-                        destination_db_key = destination_db_key.with_password(&destination_db_password);
-                        destination_db_password
-                    }
+                    // Use the same password as destination (already prompted in main)
+                    args.password.as_ref().unwrap().clone()
                 } else {
                     rpassword::prompt_password("Password for the source database: ")
                         .expect("Could not read password from TTY")
@@ -219,10 +203,10 @@ fn main() -> Result<std::process::ExitCode> {
 
             // TODO support keyfile
 
-            if let Some(slot) = args.slot_from {
+            if let Some(slot) = &args.slot_from {
                 let yubikey = ChallengeResponseKey::get_yubikey(args.serial_number_from)?;
                 source_db_key = source_db_key
-                    .with_challenge_response_key(ChallengeResponseKey::YubikeyChallenge(yubikey, slot));
+                    .with_challenge_response_key(ChallengeResponseKey::YubikeyChallenge(yubikey, slot.clone()));
             }
 
             if source_db_key.is_empty() {
@@ -284,6 +268,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     // Handle conflicts when no strategy is specified
     let mut still_conflicting = vec![];
+    let mut auto_resolved_count = 0;
     if !args.prefer_destination && !args.prefer_source && !args.keep_both && !args.skip_conflicts && !merge_result.warnings.is_empty() {
         println!("\nConflicts detected during merge:");
         println!("  Destination database: {}", destination_db_path);
@@ -319,6 +304,7 @@ fn main() -> Result<std::process::ExitCode> {
         // Apply automatic timestamp resolutions
         if !auto_resolved.is_empty() {
             println!("Starting timestamp-based conflict resolution for {} entries...", auto_resolved.len());
+            auto_resolved_count = auto_resolved.len();
         }
         for (uuid, strategy) in &auto_resolved {
             let dest_entry = find_entry_by_uuid(&destination_db.root, &uuid).cloned();
@@ -432,7 +418,7 @@ fn main() -> Result<std::process::ExitCode> {
                 5 => {
                     println!("Merge cancelled by user.");
                     // Clean up temp file
-                    let _ = std::fs::remove_file(&temp_destination_path);
+                    cleanup_temp_file();
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
                 _ => {
@@ -608,24 +594,26 @@ fn main() -> Result<std::process::ExitCode> {
             if !save_choice {
                 println!("Not saving the database.");
                 // Clean up temp file
-                let _ = std::fs::remove_file(&temp_destination_path);
+                cleanup_temp_file();
                 return Ok(std::process::ExitCode::SUCCESS);
             }
         } else {
             println!("\nConflict resolution complete. Saving database (--yes flag set).");
         }
+    } else if auto_resolved_count > 0 && !merge_result.warnings.is_empty() {
+        // Automatic timestamp resolution - warnings are informational, don't block saving
+        println!("\nAll conflicts were automatically resolved by timestamp comparison.");
+        println!("Saving database with resolved conflicts.");
     } else if !args.force && !merge_result.warnings.is_empty() {
         println!("Warnings were generated by the merge operation. Not saving the database.");
         // Clean up temp file
-        let _ = std::fs::remove_file(&temp_destination_path);
+        cleanup_temp_file();
         return Ok(std::process::ExitCode::FAILURE);
     }
 
     if merge_result.events.len() == 0 {
         // Clean up any leftover temp files
-        if std::fs::metadata(&temp_path).is_ok() {
-            let _ = std::fs::remove_file(&temp_path);
-        }
+        cleanup_temp_file();
         println!("Nothing to merge.");
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -636,7 +624,7 @@ fn main() -> Result<std::process::ExitCode> {
     if args.dry_run {
         println!("Running in dry-run mode. Not saving the database.");
         // Clean up temp file
-        let _ = std::fs::remove_file(&temp_destination_path);
+        cleanup_temp_file();
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -651,7 +639,7 @@ fn main() -> Result<std::process::ExitCode> {
         println!("For safety, the merge operation has been cancelled.");
         println!("Please restart the merge with the current database state.");
         // Clean up temp file
-        let _ = std::fs::remove_file(&temp_destination_path);
+        cleanup_temp_file();
         return Ok(std::process::ExitCode::FAILURE);
     } else {
         println!("Original database is unchanged. Proceeding with save.");
@@ -667,6 +655,8 @@ fn main() -> Result<std::process::ExitCode> {
     match replace_original_with_temp(&destination_db_path, &temp_destination_path) {
         Ok(_) => {
             println!("Databases were merged successfully.");
+            // Clear temp path since the temp file was successfully renamed
+            cleanup_temp_file();
             Ok(std::process::ExitCode::SUCCESS)
         }
         Err(e) => {
@@ -1239,4 +1229,77 @@ fn fix_diverged_groups(source_db: &mut keepass::Database, dest_db: &keepass::Dat
     }
     
     fix_source_groups(&mut source_db.root, &dest_groups, dest_db);
+}
+
+fn main() -> Result<std::process::ExitCode> {
+    let mut args = KeepassMerge::parse();
+
+    // Clone the destination path for the signal handler
+    let destination_db_for_cleanup = args.destination_db.clone();
+
+    // Initialize logging
+    let mut builder = env_logger::Builder::from_default_env();
+    if args.verbose >= 2 {
+        builder.filter_level(log::LevelFilter::Debug);
+    } else {
+        builder.filter_level(log::LevelFilter::Info);
+    }
+    builder.init();
+
+    // Set up signal handler for graceful cleanup
+    let destination_db_for_cleanup_clone = destination_db_for_cleanup.clone();
+    ctrlc::set_handler(move || {
+        // Clean up any temp files that match the pattern
+        let destination_path = std::path::Path::new(&destination_db_for_cleanup_clone);
+        if let Ok(entries) = std::fs::read_dir(destination_path.parent().unwrap_or(std::path::Path::new("."))) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        if file_name.starts_with(".tmpkdbx.") && file_name.contains(&destination_path.file_name().unwrap().to_string_lossy().to_string()) {
+                            let _ = std::fs::remove_file(entry.path());
+                            eprintln!("\nTemporary file {} cleaned up.", entry.path().display());
+                        }
+                    }
+                }
+            }
+        }
+        std::process::exit(130); // 130 is the standard exit code for SIGINT
+    }).expect("Error setting Ctrl+C handler");
+
+    // Check if we have at least one source
+    if args.source_db.is_empty() {
+        eprintln!("Error: At least one source database must be specified");
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+
+    // If using same credentials and no password provided, prompt once for all databases
+    if args.same_credentials && args.password.is_none() && !args.no_password {
+        let password = rpassword::prompt_password("Password for the databases: ")
+            .expect("Could not read password from TTY");
+        args.password = Some(password);
+    }
+
+    // If not using same credentials and no destination password provided, prompt for destination
+    if !args.same_credentials && args.password.is_none() && !args.no_password {
+        let password = rpassword::prompt_password("Password for the destination database: ")
+            .expect("Could not read password from TTY");
+        args.password = Some(password);
+    }
+
+    // Iterate through all source databases
+    let source_paths: Vec<String> = args.source_db.clone();
+    for (index, source_path) in source_paths.iter().enumerate() {
+        println!("Merging source database {} of {}: {}", index + 1, source_paths.len(), source_path);
+
+        let result = merge_single_source(&mut args, source_path)?;
+        
+        // If this is not the last source and we had an error, we might want to continue or stop
+        // For now, let's continue with other sources even if one fails
+        if result != std::process::ExitCode::SUCCESS {
+            eprintln!("Warning: Failed to merge source database: {}", source_path);
+        }
+    }
+
+    println!("All source databases have been processed.");
+    Ok(std::process::ExitCode::SUCCESS)
 }
