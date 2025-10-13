@@ -188,7 +188,7 @@ fn main() -> Result<std::process::ExitCode> {
     println!("Opening the destination database.");
     let mut destination_db = Database::open(&mut destination_db_file, destination_db_key.clone())?;
 
-    let source_db = match args.same_credentials {
+    let mut source_db = match args.same_credentials {
         true => {
             println!("Opening the source database.");
             Database::open(&mut source_db_file, destination_db_key.clone())
@@ -254,8 +254,27 @@ fn main() -> Result<std::process::ExitCode> {
     let merge_result = match destination_db.merge(&source_db) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{}", e);
-            return Ok(std::process::ExitCode::FAILURE);
+            let error_msg = format!("{}", e);
+            // Handle the case where groups have diverged with same timestamp
+            if error_msg.contains("GroupModificationTimeNotUpdated") || error_msg.contains("have the same modification time but have diverged") {
+                eprintln!("Detected groups with same modification time but diverged content.");
+                eprintln!("Attempting to fix by adjusting source group timestamps...");
+                
+                // Find groups with same UUID and timestamp but different content
+                fix_diverged_groups(&mut source_db, &destination_db);
+                
+                // Retry the merge
+                match destination_db.merge(&source_db) {
+                    Ok(r) => r,
+                    Err(e2) => {
+                        eprintln!("Merge failed even after fixing timestamps: {}", e2);
+                        return Ok(std::process::ExitCode::FAILURE);
+                    }
+                }
+            } else {
+                eprintln!("{}", e);
+                return Ok(std::process::ExitCode::FAILURE);
+            }
         }
     };
 
@@ -689,6 +708,20 @@ fn find_entry_by_uuid_mut<'a>(group: &'a mut Group, uuid: &str) -> Option<&'a mu
                 if e.uuid.to_string() == uuid {
                     return Some(e);
                 }
+            }
+        }
+    }
+    None
+}
+
+fn find_group_by_uuid<'a>(group: &'a Group, uuid: Uuid) -> Option<&'a Group> {
+    if group.uuid == uuid {
+        return Some(group);
+    }
+    for node in &group.children {
+        if let Node::Group(g) = node {
+            if let Some(found) = find_group_by_uuid(g, uuid) {
+                return Some(found);
             }
         }
     }
@@ -1144,4 +1177,66 @@ fn count_entries(group: &keepass::db::Group) -> usize {
         }
     }
     count
+}
+
+fn fix_diverged_groups(source_db: &mut keepass::Database, dest_db: &keepass::Database) {
+    use keepass::db::{Group, Node};
+    use std::collections::HashMap;
+    
+    // Collect all groups from destination by UUID with their timestamps
+    let mut dest_groups = HashMap::new();
+    fn collect_groups(group: &Group, groups: &mut HashMap<Uuid, chrono::NaiveDateTime>) {
+        if let Some(time) = group.times.get_last_modification() {
+            groups.insert(group.uuid, *time);
+        }
+        for node in &group.children {
+            if let Node::Group(child) = node {
+                collect_groups(child, groups);
+            }
+        }
+    }
+    collect_groups(&dest_db.root, &mut dest_groups);
+    
+    // Fix source groups that have matching UUID and same timestamp but diverged
+    fn fix_source_groups(source_group: &mut Group, dest_groups: &HashMap<Uuid, chrono::NaiveDateTime>, dest_db: &keepass::Database) {
+        if let Some(dest_time) = dest_groups.get(&source_group.uuid) {
+            let source_time_opt = source_group.times.get_last_modification();
+            if let Some(source_time_ref) = source_time_opt {
+                let source_time = *source_time_ref;
+                if source_time == *dest_time {
+                    // Find the corresponding dest group to check divergence
+                    if let Some(dest_group) = find_group_by_uuid(&dest_db.root, source_group.uuid) {
+                        // Check if groups diverged by comparing relevant fields
+                        let groups_diverged = source_group.name != dest_group.name ||
+                            source_group.notes != dest_group.notes ||
+                            source_group.icon_id != dest_group.icon_id ||
+                            source_group.custom_icon_uuid != dest_group.custom_icon_uuid ||
+                            source_group.custom_data != dest_group.custom_data ||
+                            source_group.is_expanded != dest_group.is_expanded ||
+                            source_group.default_autotype_sequence != dest_group.default_autotype_sequence ||
+                            source_group.enable_autotype != dest_group.enable_autotype ||
+                            source_group.enable_searching != dest_group.enable_searching ||
+                            source_group.last_top_visible_entry != dest_group.last_top_visible_entry;
+                        
+                        if groups_diverged {
+                            // Make source timestamp newer by 1 second
+                            let new_time = source_time + chrono::Duration::seconds(1);
+                            source_group.times.set_last_modification(new_time);
+                            println!("Adjusted timestamp for group {} from {} to {}", 
+                                source_group.uuid, source_time, new_time);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Recursively fix child groups
+        for node in &mut source_group.children {
+            if let Node::Group(child) = node {
+                fix_source_groups(child, dest_groups, dest_db);
+            }
+        }
+    }
+    
+    fix_source_groups(&mut source_db.root, &dest_groups, dest_db);
 }
