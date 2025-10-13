@@ -3,7 +3,7 @@ use std::fs::File;
 
 use anyhow::Result;
 use clap::Parser;
-use keepass::{db::NodeRef, Database, DatabaseKey};
+use keepass::{Database, DatabaseKey};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -66,4 +66,4 @@ fn repair_group(group: &mut keepass::db::Group) {
     }
 }
 
-fn repair_entry(entry: &mut keepass::db::Entry) {}
+fn repair_entry(_entry: &mut keepass::db::Entry) {}

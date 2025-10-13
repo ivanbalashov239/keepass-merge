@@ -17,6 +17,7 @@ name = "keepass-repair"
 clap = { version = "4", features = ["derive"] }
 rpassword = { version = "7" }
 anyhow = { version = "1" }
+regex = "1"
 
 [dependencies.keepass]
 git = "https://github.com/sseemayer/keepass-rs"
