@@ -83,7 +83,7 @@ struct KeepassMerge {
 }
 
 fn main() -> Result<std::process::ExitCode> {
-    let args = KeepassMerge::parse();
+    let mut args = KeepassMerge::parse();
 
     // Validate merge strategy options are mutually exclusive
     let strategy_count = args.prefer_destination as u8 + args.prefer_source as u8 + args.keep_both as u8 + args.skip_conflicts as u8;
@@ -178,6 +178,77 @@ fn main() -> Result<std::process::ExitCode> {
             return Ok(std::process::ExitCode::FAILURE);
         }
     };
+
+    // Handle conflicts when no strategy is specified
+    if !args.interactive && !args.prefer_destination && !args.prefer_source && !args.keep_both && !args.skip_conflicts && !merge_result.warnings.is_empty() {
+        println!("\nConflicts detected during merge:");
+        println!("  Destination database: {}", destination_db_path);
+        println!("  Source database: {}", source_db_path);
+        
+        // Show diffs for all conflicting entries
+        let mut conflicting_uuids = std::collections::HashSet::new();
+        for warning in &merge_result.warnings {
+            if let Some(uuid) = extract_uuid_from_warning(warning) {
+                conflicting_uuids.insert(uuid);
+            }
+        }
+        
+        println!("\nDetailed conflicts:");
+        for uuid in &conflicting_uuids {
+            println!("\n--- Entry {} ---", uuid);
+            let dest_entry = find_entry_by_uuid(&destination_db.root, uuid);
+            let source_entry = find_entry_by_uuid(&source_db.root, uuid);
+            match (dest_entry, source_entry) {
+                (Some(de), Some(se)) => {
+                    compare_entries(de, se, "destination", "source");
+                }
+                (Some(_de), None) => {
+                    println!("  Entry only in destination database.");
+                }
+                (None, Some(_se)) => {
+                    println!("  Entry only in source database.");
+                }
+                (None, None) => {
+                    println!("  Entry not found in either database.");
+                }
+            }
+        }
+        
+        println!("\nChoose how to resolve {} conflicting entries:", merge_result.warnings.len() / 2);
+        println!("1. Keep destination versions (discard source changes)");
+        println!("2. Keep source versions (overwrite destination)");
+        println!("3. Keep both versions (create duplicates)");
+        println!("4. Skip all conflicts (remove conflicting entries)");
+        println!("5. Cancel merge (don't save)");
+        
+        let choice = get_user_choice_with_range(5);
+        match choice {
+            1 => {
+                args.prefer_destination = true;
+                println!("Applying: Keep destination versions");
+            }
+            2 => {
+                args.prefer_source = true;
+                println!("Applying: Keep source versions");
+            }
+            3 => {
+                args.keep_both = true;
+                println!("Applying: Keep both versions");
+            }
+            4 => {
+                args.skip_conflicts = true;
+                println!("Applying: Skip all conflicts");
+            }
+            5 => {
+                println!("Merge cancelled by user.");
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            _ => {
+                println!("Invalid choice, using default: Keep both versions");
+                args.keep_both = true;
+            }
+        }
+    }
 
     // Apply conflict resolution strategies for conflicting entries
     if args.prefer_destination || args.prefer_source || args.keep_both || args.skip_conflicts {
@@ -453,22 +524,26 @@ fn extract_uuid_from_warning(warning: &str) -> Option<String> {
 }
 
 fn get_user_choice() -> u32 {
+    get_user_choice_with_range(4)
+}
+
+fn get_user_choice_with_range(max_choice: u32) -> u32 {
     use std::io::{self, Write};
     
     loop {
-        print!("Enter your choice (1-4) [default: 3]: ");
+        print!("Enter your choice (1-{}): ", max_choice);
         io::stdout().flush().unwrap();
         
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
             Ok(_) => {
                 let trimmed = input.trim();
-                if trimmed.is_empty() {
-                    return 3; // Default choice
+                if trimmed.is_empty() && max_choice >= 3 {
+                    return 3; // Default choice for global conflicts
                 }
                 match trimmed.parse::<u32>() {
-                    Ok(choice) if choice >= 1 && choice <= 4 => return choice,
-                    _ => println!("Please enter a number between 1 and 4, or press Enter for default (3)."),
+                    Ok(choice) if choice >= 1 && choice <= max_choice => return choice,
+                    _ => println!("Please enter a number between 1 and {}.", max_choice),
                 }
             }
             Err(_) => {
