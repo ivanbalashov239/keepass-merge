@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Read, Write};
 
 use anyhow::Result;
 use clap::Parser;
@@ -101,7 +102,18 @@ fn main() -> Result<std::process::ExitCode> {
     let destination_db_path = args.destination_db;
     let source_db_path = args.source_db;
 
-    let mut destination_db_file = File::open(&destination_db_path)?;
+    // Read and store the original destination database content for integrity checking
+    println!("Reading original destination database...");
+    let mut original_db_file = File::open(&destination_db_path)?;
+    let mut original_db_content = Vec::new();
+    original_db_file.read_to_end(&mut original_db_content)?;
+
+    // Create a temporary copy of the destination database for safe operations
+    println!("Creating temporary copy of destination database...");
+    let temp_destination_path = create_temp_db_copy(&destination_db_path)
+        .map_err(|e| anyhow::format_err!("Failed to create temporary copy of destination database: {}", e))?;
+
+    let mut destination_db_file = File::open(&temp_destination_path)?;
     let mut source_db_file = File::open(&source_db_path)?;
 
     let mut destination_db_key = DatabaseKey::new();
@@ -241,6 +253,8 @@ fn main() -> Result<std::process::ExitCode> {
             }
             5 => {
                 println!("Merge cancelled by user.");
+                // Clean up temp file
+                let _ = std::fs::remove_file(&temp_destination_path);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             _ => {
@@ -384,6 +398,8 @@ fn main() -> Result<std::process::ExitCode> {
             let save_choice = get_yes_no_choice();
             if !save_choice {
                 println!("Not saving the database.");
+                // Clean up temp file
+                let _ = std::fs::remove_file(&temp_destination_path);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
         } else {
@@ -404,15 +420,47 @@ fn main() -> Result<std::process::ExitCode> {
     }
     if args.dry_run {
         println!("Running in dry-run mode. Not saving the database.");
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_destination_path);
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    println!("Destination database was modified. Saving the database.");
-    let mut destination_db_file = File::options().write(true).open(&destination_db_path)?;
-    destination_db.save(&mut destination_db_file, destination_db_key)?;
-    println!("Databases were merged successfully.");
+    // Check if the original destination file is still the same before saving
+    println!("Checking if destination database is unchanged...");
+    let mut current_original_file = File::open(&destination_db_path)?;
+    let mut current_original_content = Vec::new();
+    current_original_file.read_to_end(&mut current_original_content)?;
+    
+    if current_original_content != original_db_content {
+        println!("ERROR: The original destination database has been modified since the merge started!");
+        println!("For safety, the merge operation has been cancelled.");
+        println!("Please restart the merge with the current database state.");
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_destination_path);
+        return Ok(std::process::ExitCode::FAILURE);
+    } else {
+        println!("Original database is unchanged. Proceeding with save.");
+    }
 
-    Ok(std::process::ExitCode::SUCCESS)
+    println!("Destination database was modified. Saving the database.");
+    
+    // Save to the temporary file first
+    let mut temp_db_file = File::options().write(true).open(&temp_destination_path)?;
+    destination_db.save(&mut temp_db_file, destination_db_key)?;
+    
+    // Now replace the original with the modified temp file
+    match replace_original_with_temp(&destination_db_path, &temp_destination_path) {
+        Ok(_) => {
+            println!("Databases were merged successfully.");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            println!("ERROR: Failed to replace original database with merged version: {}", e);
+            println!("The merged database is saved as: {}", temp_destination_path);
+            println!("You can manually replace the original file if needed.");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+    }
 }
 
 fn find_entry_by_uuid<'a>(group: &'a Group, uuid: &str) -> Option<&'a Entry> {
@@ -565,4 +613,27 @@ fn get_yes_no_choice() -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn create_temp_db_copy(original_path: &str) -> Result<String, std::io::Error> {
+    let temp_path = format!("{}.tmp", original_path);
+    
+    // Read the original file
+    let mut original_file = File::open(original_path)?;
+    let mut buffer = Vec::new();
+    original_file.read_to_end(&mut buffer)?;
+    
+    // Write to temporary file
+    let mut temp_file = File::create(&temp_path)?;
+    temp_file.write_all(&buffer)?;
+    temp_file.flush()?;
+    
+    Ok(temp_path)
+}
+
+fn replace_original_with_temp(original_path: &str, temp_path: &str) -> Result<(), std::io::Error> {
+    // Replace original with temp
+    // std::fs::remove_file(original_path)?;
+    std::fs::rename(temp_path, original_path)?;
+    Ok(())
 }
