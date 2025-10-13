@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use keepass::{db::{Entry, Group, Node}, ChallengeResponseKey, Database, DatabaseKey};
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 /// Contact manager based on the KDBX4 encrypted database format
 #[derive(Parser)]
@@ -81,10 +82,27 @@ struct KeepassMerge {
     /// Automatically save the database without asking for confirmation.
     #[clap(long, short)]
     yes: bool,
+
+    /// Threshold for automatic resolution based on modified time (default: 1M). Can be specified as seconds or with units: 1s, 1m, 1h, 1d, 1M, 1y, 1day, 1month, etc.
+    #[clap(long, default_value = "1M")]
+    threshold: String,
+
+    /// Ignore threshold comparisons and use other merge strategies.
+    #[clap(long)]
+    ignore_threshold: bool,
 }
 
 fn main() -> Result<std::process::ExitCode> {
     let mut args = KeepassMerge::parse();
+
+    // Parse threshold
+    let threshold_seconds = match parse_threshold(&args.threshold) {
+        Ok(seconds) => seconds,
+        Err(e) => {
+            eprintln!("Error parsing threshold: {}", e);
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+    };
 
     // Validate merge strategy options are mutually exclusive
     let strategy_count = args.prefer_destination as u8 + args.prefer_source as u8 + args.keep_both as u8 + args.skip_conflicts as u8;
@@ -197,7 +215,10 @@ fn main() -> Result<std::process::ExitCode> {
         println!("  Destination database: {}", destination_db_path);
         println!("  Source database: {}", source_db_path);
         
-        // Show diffs for all conflicting entries
+        // Check if conflicts can be resolved by timestamp
+        let mut auto_resolved = vec![];
+        let mut still_conflicting = vec![];
+        
         let mut conflicting_uuids = std::collections::HashSet::new();
         for warning in &merge_result.warnings {
             if let Some(uuid) = extract_uuid_from_warning(warning) {
@@ -205,62 +226,111 @@ fn main() -> Result<std::process::ExitCode> {
             }
         }
         
-        println!("\nDetailed conflicts:");
         for uuid in &conflicting_uuids {
-            println!("\n--- Entry {} ---", uuid);
-            let dest_entry = find_entry_by_uuid(&destination_db.root, uuid);
-            let source_entry = find_entry_by_uuid(&source_db.root, uuid);
-            match (dest_entry, source_entry) {
-                (Some(de), Some(se)) => {
-                    compare_entries(de, se, "destination", "source");
+            if let (Some(dest_entry), Some(source_entry)) = (
+                find_entry_by_uuid(&destination_db.root, uuid),
+                find_entry_by_uuid(&source_db.root, uuid)
+            ) {
+                if !args.ignore_threshold {
+                    if let Some(strategy) = resolve_conflict_by_timestamp(dest_entry, source_entry, threshold_seconds) {
+                        auto_resolved.push((uuid.clone(), strategy));
+                        continue;
+                    }
                 }
-                (Some(_de), None) => {
-                    println!("  Entry only in destination database.");
-                }
-                (None, Some(_se)) => {
-                    println!("  Entry only in source database.");
-                }
-                (None, None) => {
-                    println!("  Entry not found in either database.");
+            }
+            still_conflicting.push(uuid.clone());
+        }
+        
+        // Apply automatic timestamp resolutions
+        for (uuid, strategy) in &auto_resolved {
+            if let (Some(_dest_entry), Some(source_entry)) = (
+                find_entry_by_uuid(&destination_db.root, uuid),
+                find_entry_by_uuid(&source_db.root, uuid)
+            ) {
+                match *strategy {
+                    "prefer-destination" => {
+                        println!("Entry {} resolved by timestamp: keeping destination version", uuid);
+                    }
+                    "prefer-source" => {
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
+                            dest_entry_mut.fields = source_entry.fields.clone();
+                            dest_entry_mut.tags = source_entry.tags.clone();
+                            println!("Entry {} resolved by timestamp: replaced with source version", uuid);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         
-        println!("\nChoose how to resolve {} conflicting entries:", merge_result.warnings.len() / 2);
-        println!("1. Keep destination versions (discard source changes)");
-        println!("2. Keep source versions (overwrite destination)");
-        println!("3. Keep both versions (create duplicates)");
-        println!("4. Skip all conflicts (remove conflicting entries)");
-        println!("5. Cancel merge (don't save)");
-        
-        let choice = get_user_choice_with_range(5);
-        match choice {
-            1 => {
-                args.prefer_destination = true;
-                println!("Applying: Keep destination versions");
+        if !still_conflicting.is_empty() {
+            println!("\n{} entries were automatically resolved by timestamp comparison.", auto_resolved.len());
+            println!("{} entries still have conflicts and need manual resolution.", still_conflicting.len());
+            
+            // Show diffs for remaining conflicting entries
+            println!("\nDetailed conflicts:");
+            for uuid in &still_conflicting {
+                println!("\n--- Entry {} ---", uuid);
+                let dest_entry = find_entry_by_uuid(&destination_db.root, uuid);
+                let source_entry = find_entry_by_uuid(&source_db.root, uuid);
+                match (dest_entry, source_entry) {
+                    (Some(de), Some(se)) => {
+                        compare_entries(de, se, "destination", "source");
+                    }
+                    (Some(_de), None) => {
+                        println!("  Entry only in destination database.");
+                    }
+                    (None, Some(_se)) => {
+                        println!("  Entry only in source database.");
+                    }
+                    (None, None) => {
+                        println!("  Entry not found in either database.");
+                    }
+                }
             }
-            2 => {
-                args.prefer_source = true;
-                println!("Applying: Keep source versions");
+            
+            println!("\nChoose how to resolve {} remaining conflicting entries:", still_conflicting.len());
+            println!("1. Keep destination versions (discard source changes)");
+            println!("2. Keep source versions (overwrite destination)");
+            println!("3. Keep both versions (create duplicates)");
+            println!("4. Skip all conflicts (remove conflicting entries)");
+            println!("5. Cancel merge (don't save)");
+            
+            if !args.ignore_threshold {
+                println!("\nNote: Entries with significantly different modification times (>={}s) were already resolved automatically.", args.threshold);
             }
-            3 => {
-                args.keep_both = true;
-                println!("Applying: Keep both versions");
+            
+            let choice = get_user_choice_with_range(5);
+            match choice {
+                1 => {
+                    args.prefer_destination = true;
+                    println!("Applying: Keep destination versions");
+                }
+                2 => {
+                    args.prefer_source = true;
+                    println!("Applying: Keep source versions");
+                }
+                3 => {
+                    args.keep_both = true;
+                    println!("Applying: Keep both versions");
+                }
+                4 => {
+                    args.skip_conflicts = true;
+                    println!("Applying: Skip all conflicts");
+                }
+                5 => {
+                    println!("Merge cancelled by user.");
+                    // Clean up temp file
+                    let _ = std::fs::remove_file(&temp_destination_path);
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                _ => {
+                    println!("Invalid choice, using default: Keep both versions");
+                    args.keep_both = true;
+                }
             }
-            4 => {
-                args.skip_conflicts = true;
-                println!("Applying: Skip all conflicts");
-            }
-            5 => {
-                println!("Merge cancelled by user.");
-                // Clean up temp file
-                let _ = std::fs::remove_file(&temp_destination_path);
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-            _ => {
-                println!("Invalid choice, using default: Keep both versions");
-                args.keep_both = true;
-            }
+        } else {
+            println!("\nAll {} conflicts were automatically resolved by timestamp comparison!", auto_resolved.len());
         }
     }
 
@@ -286,18 +356,33 @@ fn main() -> Result<std::process::ExitCode> {
         }
 
         for uuid in &conflicting_uuids {
-            if let Some(source_entry) = find_entry_by_uuid(&source_db.root, uuid) {
-                match strategy {
+            if let (Some(dest_entry), Some(source_entry)) = (
+                find_entry_by_uuid(&destination_db.root, uuid),
+                find_entry_by_uuid(&source_db.root, uuid)
+            ) {
+                // First, try to resolve by timestamp if not ignoring threshold
+                let effective_strategy = if !args.ignore_threshold {
+                    if let Some(timestamp_strategy) = resolve_conflict_by_timestamp(dest_entry, source_entry, threshold_seconds) {
+                        println!("Entry {} resolved by timestamp comparison: {}", uuid, timestamp_strategy);
+                        timestamp_strategy
+                    } else {
+                        strategy
+                    }
+                } else {
+                    strategy
+                };
+
+                match effective_strategy {
                     "prefer-destination" => {
                         // Destination entry is already kept by merge, source is ignored
                         println!("Keeping destination version for entry {}", uuid);
                     }
                     "prefer-source" => {
                         // Replace destination entry with source entry
-                        if let Some(dest_entry) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
                             // Copy source entry data to destination entry
-                            dest_entry.fields = source_entry.fields.clone();
-                            dest_entry.tags = source_entry.tags.clone();
+                            dest_entry_mut.fields = source_entry.fields.clone();
+                            dest_entry_mut.tags = source_entry.tags.clone();
                             // Keep the same UUID and other metadata
                             println!("Replaced destination entry {} with source version", uuid);
                         }
@@ -372,7 +457,24 @@ fn main() -> Result<std::process::ExitCode> {
             if let (Some(de), Some(se)) = (dest_entry, source_entry) {
                 compare_entries(de, se, "destination", "source");
                 
+                // Check for timestamp-based resolution
+                let timestamp_suggestion = if !args.ignore_threshold {
+                    resolve_conflict_by_timestamp(de, se, threshold_seconds)
+                } else {
+                    None
+                };
+                
                 println!("\nChoose resolution:");
+                if let Some(suggestion) = timestamp_suggestion {
+                    let suggestion_text = match suggestion {
+                        "prefer-destination" => "1. Keep destination version (newer)",
+                        "prefer-source" => "2. Keep source version (newer)",
+                        _ => "",
+                    };
+                    if !suggestion_text.is_empty() {
+                        println!("  {} [RECOMMENDED - based on modification time]", suggestion_text);
+                    }
+                }
                 println!("1. Keep destination version");
                 println!("2. Keep source version");
                 println!("3. Keep both versions (default merge behavior)");
@@ -545,6 +647,42 @@ fn compare_entries(entry1: &Entry, entry2: &Entry, label1: &str, label2: &str) {
         }
     }
 
+    // Show modification timestamps
+    let time1 = parse_modified_timestamp(entry1);
+    let time2 = parse_modified_timestamp(entry2);
+    
+    println!("  Modification times:");
+    match (time1, time2) {
+        (Some(t1), Some(t2)) => {
+            println!("    {}: {}", label1, format_timestamp(t1));
+            println!("    {}: {}", label2, format_timestamp(t2));
+            
+            // Calculate and show difference
+            let (newer, older, newer_label, older_label) = if t1 > t2 {
+                (t1, t2, label1, label2)
+            } else {
+                (t2, t1, label2, label1)
+            };
+            
+            if let Some(duration) = newer.duration_since(older).ok() {
+                let secs = duration.as_secs();
+                let (value, unit) = format_duration(secs);
+                println!("    Difference: {} is {:.1}{} newer than {}", newer_label, value, unit, older_label);
+            }
+        }
+        (Some(t1), None) => {
+            println!("    {}: {}", label1, format_timestamp(t1));
+            println!("    {}: <no timestamp>", label2);
+        }
+        (None, Some(t2)) => {
+            println!("    {}: <no timestamp>", label1);
+            println!("    {}: {}", label2, format_timestamp(t2));
+        }
+        (None, None) => {
+            println!("    No timestamps available for comparison");
+        }
+    }
+
     // Show differences
     let field_names = vec!["Title", "UserName", "URL", "Notes"];
 
@@ -636,4 +774,133 @@ fn replace_original_with_temp(original_path: &str, temp_path: &str) -> Result<()
     // std::fs::remove_file(original_path)?;
     std::fs::rename(temp_path, original_path)?;
     Ok(())
+}
+
+fn format_timestamp(time: std::time::SystemTime) -> String {
+    if let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) {
+        if let Some(datetime) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
+            datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+        } else {
+            "<invalid timestamp>".to_string()
+        }
+    } else {
+        "<invalid timestamp>".to_string()
+    }
+}
+
+fn format_duration(seconds: u64) -> (f64, &'static str) {
+    if seconds < 60 {
+        (seconds as f64, "s")
+    } else if seconds < 3600 {
+        ((seconds as f64) / 60.0, "m")
+    } else if seconds < 86400 {
+        ((seconds as f64) / 3600.0, "h")
+    } else if seconds < 2592000 {
+        ((seconds as f64) / 86400.0, "d")
+    } else if seconds < 31536000 {
+        ((seconds as f64) / 2592000.0, "M")
+    } else {
+        ((seconds as f64) / 31536000.0, "y")
+    }
+}
+
+fn parse_threshold(threshold_str: &str) -> Result<u64, String> {
+    let threshold_str = threshold_str.trim();
+    
+    // Try to parse as a plain number first (backward compatibility)
+    if let Ok(seconds) = threshold_str.parse::<u64>() {
+        return Ok(seconds);
+    }
+    
+    // Parse number and unit (case-insensitive with (?i))
+    let re = regex::Regex::new(r"(?i)^(\d+)([smhdMy]|second|minute|hour|day|month|year|seconds|minutes|hours|days|months|years)?$").unwrap();
+    
+    if let Some(captures) = re.captures(threshold_str) {
+        let number: u64 = captures[1].parse().map_err(|_| "Invalid number")?;
+        let unit = captures.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_else(|| "s".to_string());
+        
+        let multiplier = match unit.as_str() {
+            "s" | "second" | "seconds" => 1,
+            "m" | "minute" | "minutes" => 60,
+            "h" | "hour" | "hours" => 3600,
+            "d" | "day" | "days" => 86400,
+            "M" | "month" | "months" => 2592000, // 30 days
+            "y" | "year" | "years" => 31536000, // 365 days
+            _ => return Err(format!("Unknown time unit: {}", unit)),
+        };
+        
+        Ok(number * multiplier)
+    } else {
+        Err(format!("Invalid threshold format: {}. Expected format: <number>[<unit>], where unit can be s/m/h/d/M/y or second/minute/hour/day/month/year", threshold_str))
+    }
+}
+
+fn parse_modified_timestamp(entry: &Entry) -> Option<std::time::SystemTime> {
+    // First try to get the timestamp from the times field
+    if let Some(mod_time) = entry.times.times.get("LastModificationTime") {
+        // Convert NaiveDateTime to SystemTime
+        // KeePass stores times as local time, but we'll assume they're close enough to UTC for comparison
+        // Convert to UTC assuming the stored time is in UTC
+        let datetime_utc = DateTime::<Utc>::from_naive_utc_and_offset(*mod_time, Utc);
+        Some(datetime_utc.into())
+    } else {
+        // Fallback to fields (for backward compatibility or if times field is not populated)
+        let possible_fields = ["LastModificationTime", "Modified", "Times.LastModificationTime"];
+        
+        for field_name in &possible_fields {
+            if let Some(value) = entry.fields.get(*field_name) {
+                // Convert Value to string
+                let value_str: &str = match value {
+                    keepass::db::Value::Unprotected(s) => s,
+                    keepass::db::Value::Protected(p) => {
+                        std::str::from_utf8(p.unsecure()).unwrap_or("")
+                    },
+                    keepass::db::Value::Bytes(_) => continue, // Skip binary fields
+                };
+                
+                // Try parsing as Unix timestamp first
+                if let Ok(timestamp) = value_str.parse::<i64>() {
+                    if timestamp > 0 {
+                        return Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64));
+                    }
+                }
+                
+                // Try parsing as ISO 8601 datetime string
+                if let Ok(dt) = DateTime::parse_from_rfc3339(value_str) {
+                    return Some(dt.with_timezone(&Utc).into());
+                }
+                if let Ok(dt) = DateTime::parse_from_rfc2822(value_str) {
+                    return Some(dt.with_timezone(&Utc).into());
+                }
+            }
+        }
+        
+        None
+    }
+}
+
+fn resolve_conflict_by_timestamp<'a>(dest_entry: &'a Entry, source_entry: &'a Entry, threshold_seconds: u64) -> Option<&'static str> {
+    let dest_time = parse_modified_timestamp(dest_entry);
+    let source_time = parse_modified_timestamp(source_entry);
+    
+    match (dest_time, source_time) {
+        (Some(dt), Some(st)) => {
+            let duration = if dt > st {
+                dt.duration_since(st).ok()?
+            } else {
+                st.duration_since(dt).ok()?
+            };
+            
+            if duration.as_secs() >= threshold_seconds {
+                if dt > st {
+                    Some("prefer-destination")
+                } else {
+                    Some("prefer-source")
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
