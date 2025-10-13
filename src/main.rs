@@ -6,6 +6,7 @@ use clap::Parser;
 use keepass::{db::{Entry, Group, Node}, ChallengeResponseKey, Database, DatabaseKey};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use log;
 
 /// Contact manager based on the KDBX4 encrypted database format
 #[derive(Parser)]
@@ -22,6 +23,14 @@ struct KeepassMerge {
     /// Do not use a password to decrypt the destination database
     #[clap(long, short)]
     no_password: bool,
+
+    /// Password for the destination database (for testing)
+    #[clap(long)]
+    password: Option<String>,
+
+    /// Password for the source database (for testing)
+    #[clap(long)]
+    password_from: Option<String>,
 
     /// Use the same credentials for both databases.
     #[clap(long, short)]
@@ -55,9 +64,9 @@ struct KeepassMerge {
     #[clap(long, short)]
     force: bool,
 
-    /// Show verbose output with field differences for conflicting entries.
-    #[clap(long, short)]
-    verbose: bool,
+    /// Show verbose output with field differences for conflicting entries. Use -vv for debug logging.
+    #[clap(long, short, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Interactive mode: resolve conflicts manually.
     #[clap(long, short)]
@@ -94,6 +103,15 @@ struct KeepassMerge {
 
 fn main() -> Result<std::process::ExitCode> {
     let mut args = KeepassMerge::parse();
+    
+    // Initialize logging
+    let mut builder = env_logger::Builder::from_default_env();
+    if args.verbose >= 2 {
+        builder.filter_level(log::LevelFilter::Debug);
+    } else {
+        builder.filter_level(log::LevelFilter::Info);
+    }
+    builder.init();
 
     // Parse threshold
     let threshold_seconds = match parse_threshold(&args.threshold) {
@@ -119,6 +137,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     let destination_db_path = args.destination_db;
     let source_db_path = args.source_db;
+    let temp_path = format!(".tmpkdbx.{}", destination_db_path);
 
     // Read and store the original destination database content for integrity checking
     println!("Reading original destination database...");
@@ -128,7 +147,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     // Create a temporary copy of the destination database for safe operations
     println!("Creating temporary copy of destination database...");
-    let temp_destination_path = create_temp_db_copy(&destination_db_path)
+    let temp_destination_path = create_temp_db_copy(&temp_path, &destination_db_path)
         .map_err(|e| anyhow::format_err!("Failed to create temporary copy of destination database: {}", e))?;
 
     let mut destination_db_file = File::open(&temp_destination_path)?;
@@ -137,15 +156,17 @@ fn main() -> Result<std::process::ExitCode> {
     let mut destination_db_key = DatabaseKey::new();
 
     if !args.no_password {
-        let mut password_prompt = "Password for the destination database: ";
-        // Use a slightly more meaningful prompt if the password is that same
-        // for both databases.
-        if args.same_credentials {
-            password_prompt = "Password for the databases: ";
-        }
+        let destination_db_password = if let Some(ref pwd) = args.password {
+            pwd.clone()
+        } else {
+            let password_prompt = if args.same_credentials {
+                "Password for the databases: "
+            } else {
+                "Password for the destination database: "
+            };
 
-        let destination_db_password =
-            rpassword::prompt_password(password_prompt).expect("Could not read password from TTY");
+            rpassword::prompt_password(password_prompt).expect("Could not read password from TTY")
+        };
         destination_db_key = destination_db_key.with_password(&destination_db_password);
     }
 
@@ -175,8 +196,22 @@ fn main() -> Result<std::process::ExitCode> {
             let mut source_db_key = DatabaseKey::new();
 
             if !args.no_password_from {
-                let source_db_password = rpassword::prompt_password("Password for the source database: ")
-                    .expect("Could not read password from TTY");
+                let source_db_password = if let Some(ref pwd) = args.password_from {
+                    pwd.clone()
+                } else if args.same_credentials {
+                    // Use the same password as destination
+                    if let Some(ref pwd) = args.password {
+                        pwd.clone()
+                    } else {
+                        let destination_db_password = rpassword::prompt_password("Password for the databases: ")
+                            .expect("Could not read password from TTY");
+                        destination_db_key = destination_db_key.with_password(&destination_db_password);
+                        destination_db_password
+                    }
+                } else {
+                    rpassword::prompt_password("Password for the source database: ")
+                        .expect("Could not read password from TTY")
+                };
 
                 source_db_key = source_db_key.with_password(&source_db_password);
             }
@@ -200,7 +235,21 @@ fn main() -> Result<std::process::ExitCode> {
         }
     }?;
 
-    println!("Merging the databases.");
+    if args.verbose > 0 {
+        let dest_count = count_entries(&destination_db.root);
+        let source_count = count_entries(&source_db.root);
+        println!("Destination database has {} entries.", dest_count);
+        println!("Source database has {} entries.", source_count);
+    }
+    
+    // Collect original timestamps before merge for conflict resolution
+    let mut original_timestamps = std::collections::HashMap::new();
+    collect_original_timestamps(&destination_db.root, &source_db.root, &mut original_timestamps);
+    
+    if args.verbose > 0 {
+        println!("Analyzed {} entries for timestamp information.", original_timestamps.len());
+    }
+    
     let merge_result = match destination_db.merge(&source_db) {
         Ok(r) => r,
         Err(e) => {
@@ -209,15 +258,19 @@ fn main() -> Result<std::process::ExitCode> {
         }
     };
 
+    if args.verbose > 0 {
+        println!("Merge completed with {} warnings.", merge_result.warnings.len());
+    }
+
     // Handle conflicts when no strategy is specified
-    if !args.interactive && !args.prefer_destination && !args.prefer_source && !args.keep_both && !args.skip_conflicts && !merge_result.warnings.is_empty() {
+    let mut still_conflicting = vec![];
+    if !args.prefer_destination && !args.prefer_source && !args.keep_both && !args.skip_conflicts && !merge_result.warnings.is_empty() {
         println!("\nConflicts detected during merge:");
         println!("  Destination database: {}", destination_db_path);
         println!("  Source database: {}", source_db_path);
         
         // Check if conflicts can be resolved by timestamp
         let mut auto_resolved = vec![];
-        let mut still_conflicting = vec![];
         
         let mut conflicting_uuids = std::collections::HashSet::new();
         for warning in &merge_result.warnings {
@@ -227,14 +280,16 @@ fn main() -> Result<std::process::ExitCode> {
         }
         
         for uuid in &conflicting_uuids {
-            if let (Some(dest_entry), Some(source_entry)) = (
+            if let (Some(_dest_entry), Some(_source_entry)) = (
                 find_entry_by_uuid(&destination_db.root, uuid),
                 find_entry_by_uuid(&source_db.root, uuid)
             ) {
                 if !args.ignore_threshold {
-                    if let Some(strategy) = resolve_conflict_by_timestamp(dest_entry, source_entry, threshold_seconds) {
-                        auto_resolved.push((uuid.clone(), strategy));
-                        continue;
+                    if let Some((dest_time, source_time)) = original_timestamps.get(uuid) {
+                        if let Some(strategy) = resolve_conflict_by_timestamp(*dest_time, *source_time, threshold_seconds) {
+                            auto_resolved.push((uuid.clone(), strategy));
+                            continue;
+                        }
                     }
                 }
             }
@@ -242,46 +297,44 @@ fn main() -> Result<std::process::ExitCode> {
         }
         
         // Apply automatic timestamp resolutions
+        if !auto_resolved.is_empty() {
+            println!("Starting timestamp-based conflict resolution for {} entries...", auto_resolved.len());
+        }
         for (uuid, strategy) in &auto_resolved {
             let dest_entry = find_entry_by_uuid(&destination_db.root, &uuid).cloned();
             let source_entry = find_entry_by_uuid(&source_db.root, &uuid).cloned();
             
             if let (Some(dest_entry), Some(source_entry)) = (dest_entry, source_entry) {
+                // Show diff before resolution
+                println!("\n--- Diff before resolution for entry {} ---", uuid);
+                compare_entries(&dest_entry, &source_entry, "destination", "source");
+                
                 match *strategy {
                     "prefer-destination" => {
                         // Add source entry to destination entry's history
                         if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            // Store the source entry in a custom history field
-                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
-                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
-                                if !hist_str.is_empty() {
-                                    hist_str.push('\n');
-                                }
-                                hist_str.push_str(&format!("Source entry merged at {}: Title={:?}, UserName={:?}",
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                                    source_entry.fields.get("Title"),
-                                    source_entry.fields.get("UserName")));
-                            }
+                            add_entry_to_history(dest_entry_mut, &source_entry, "Source entry merged");
                         }
                         println!("Entry {} resolved by timestamp: keeping destination version", uuid);
+                        
+                        // Show diff between final winning entry and losing entry
+                        if let Some(final_dest_entry) = find_entry_by_uuid(&destination_db.root, &uuid) {
+                            println!("\n--- Diff after resolution for entry {} ---", uuid);
+                            compare_entries(final_dest_entry, &source_entry, "destination (final)", "source (lost)");
+                        }
                     }
                     "prefer-source" => {
                         if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            // Add old destination entry to history before replacing
+                            add_entry_to_history(dest_entry_mut, &dest_entry, "Destination entry replaced");
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
-                            // Store the old destination entry in history
-                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
-                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
-                                if !hist_str.is_empty() {
-                                    hist_str.push('\n');
-                                }
-                                hist_str.push_str(&format!("Destination entry replaced at {}: Title={:?}, UserName={:?}",
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                                    dest_entry.fields.get("Title"),
-                                    dest_entry.fields.get("UserName")));
-                            }
                             println!("Entry {} resolved by timestamp: replaced with source version", uuid);
+                            
+                            // Show diff between final winning entry and losing entry
+                            if let Some(final_dest_entry) = find_entry_by_uuid(&destination_db.root, &uuid) {
+                                println!("\n--- Diff after resolution for entry {} ---", uuid);
+                                compare_entries(final_dest_entry, &dest_entry, "source (final)", "destination (lost)");
+                            }
                         }
                     }
                     _ => {}
@@ -292,6 +345,18 @@ fn main() -> Result<std::process::ExitCode> {
         if !still_conflicting.is_empty() {
             println!("\n{} entries were automatically resolved by timestamp comparison.", auto_resolved.len());
             println!("{} entries still have conflicts and need manual resolution.", still_conflicting.len());
+            
+            // Add source entries to history for conflicts that will keep destination by default
+            for uuid in &still_conflicting {
+                if let (Some(_dest_entry), Some(source_entry)) = (
+                    find_entry_by_uuid(&destination_db.root, uuid),
+                    find_entry_by_uuid(&source_db.root, uuid)
+                ) {
+                    if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
+                        add_entry_to_history(dest_entry_mut, &source_entry, "Source entry discarded");
+                    }
+                }
+            }
             
             // Show diffs for remaining conflicting entries
             println!("\nDetailed conflicts:");
@@ -388,7 +453,7 @@ fn main() -> Result<std::process::ExitCode> {
             if let (Some(dest_entry), Some(source_entry)) = (dest_entry, source_entry) {
                 // First, try to resolve by timestamp if not ignoring threshold
                 let effective_strategy = if !args.ignore_threshold {
-                    if let Some(timestamp_strategy) = resolve_conflict_by_timestamp(&dest_entry, &source_entry, threshold_seconds) {
+                    if let Some(timestamp_strategy) = resolve_conflict_by_timestamp_entries(&dest_entry, &source_entry, threshold_seconds) {
                         println!("Entry {} resolved by timestamp comparison: {}", uuid, timestamp_strategy);
                         timestamp_strategy
                     } else {
@@ -402,37 +467,16 @@ fn main() -> Result<std::process::ExitCode> {
                     "prefer-destination" => {
                         // Add source entry to destination entry's history
                         if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            // Store the source entry in a custom history field
-                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
-                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
-                                if !hist_str.is_empty() {
-                                    hist_str.push('\n');
-                                }
-                                hist_str.push_str(&format!("Source entry merged at {}: Title={:?}, UserName={:?}",
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                                    source_entry.fields.get("Title"),
-                                    source_entry.fields.get("UserName")));
-                            }
+                            add_entry_to_history(dest_entry_mut, &source_entry, "Source entry merged");
                         }
                         println!("Keeping destination version for entry {}", uuid);
                     }
                     "prefer-source" => {
                         // Replace destination entry with source entry
                         if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            // Add old destination entry to history before replacing
+                            add_entry_to_history(dest_entry_mut, &dest_entry, "Destination entry replaced");
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
-                            // Store the old destination entry in history
-                            let history_field = dest_entry_mut.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
-                            if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
-                                if !hist_str.is_empty() {
-                                    hist_str.push('\n');
-                                }
-                                hist_str.push_str(&format!("Destination entry replaced at {}: Title={:?}, UserName={:?}",
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                                    dest_entry.fields.get("Title"),
-                                    dest_entry.fields.get("UserName")));
-                            }
                             // Keep the same UUID and other metadata
                             println!("Replaced destination entry {} with source version", uuid);
                         }
@@ -460,7 +504,7 @@ fn main() -> Result<std::process::ExitCode> {
         println!("WARNING: {}", warning);
     }
 
-    if args.verbose {
+    if args.verbose > 0 {
         let mut conflicting_uuids = std::collections::HashSet::new();
         for warning in &merge_result.warnings {
             if let Some(uuid) = extract_uuid_from_warning(warning) {
@@ -489,17 +533,10 @@ fn main() -> Result<std::process::ExitCode> {
         }
     }
 
-    if args.interactive && !merge_result.warnings.is_empty() {
-        println!("\nInteractive mode: {} entries have conflicts.", merge_result.warnings.len() / 2); // Rough estimate, warnings come in pairs
+    if args.interactive && !still_conflicting.is_empty() {
+        println!("\nInteractive mode: {} entries have conflicts.", still_conflicting.len());
         
-        let mut conflicting_uuids = std::collections::HashSet::new();
-        for warning in &merge_result.warnings {
-            if let Some(uuid) = extract_uuid_from_warning(warning) {
-                conflicting_uuids.insert(uuid);
-            }
-        }
-
-        for uuid in &conflicting_uuids {
+        for uuid in &still_conflicting {
             println!("\n--- Entry {} ---", uuid);
             let dest_entry = find_entry_by_uuid(&destination_db.root, uuid);
             let source_entry = find_entry_by_uuid(&source_db.root, uuid);
@@ -509,7 +546,7 @@ fn main() -> Result<std::process::ExitCode> {
                 
                 // Check for timestamp-based resolution
                 let timestamp_suggestion = if !args.ignore_threshold {
-                    resolve_conflict_by_timestamp(de, se, threshold_seconds)
+                    resolve_conflict_by_timestamp_entries(de, se, threshold_seconds)
                 } else {
                     None
                 };
@@ -563,6 +600,10 @@ fn main() -> Result<std::process::ExitCode> {
     }
 
     if merge_result.events.len() == 0 {
+        // Clean up any leftover temp files
+        if std::fs::metadata(&temp_path).is_ok() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
         println!("Nothing to merge.");
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -698,8 +739,8 @@ fn compare_entries(entry1: &Entry, entry2: &Entry, label1: &str, label2: &str) {
     }
 
     // Show modification timestamps
-    let time1 = parse_modified_timestamp(entry1);
-    let time2 = parse_modified_timestamp(entry2);
+    let time1 = get_modification_timestamp(entry1);
+    let time2 = get_modification_timestamp(entry2);
     
     println!("  Modification times:");
     match (time1, time2) {
@@ -750,6 +791,41 @@ fn compare_entries(entry1: &Entry, entry2: &Entry, label1: &str, label2: &str) {
 
     if !has_differences {
         println!("  No field differences found (passwords not compared).");
+    }
+
+    // Show history differences
+    let merge_history1 = entry1.fields.get("MergeHistory");
+    let merge_history2 = entry2.fields.get("MergeHistory");
+    let history_count1 = entry1.history.as_ref().map(|h| h.get_entries().len()).unwrap_or(0);
+    let history_count2 = entry2.history.as_ref().map(|h| h.get_entries().len()).unwrap_or(0);
+    
+    let history_differs = merge_history1 != merge_history2 || history_count1 != history_count2;
+    
+    if history_differs {
+        println!("  History differs:");
+        if merge_history1 != merge_history2 {
+            println!("    MergeHistory {}: {:?}", label1, merge_history1);
+            println!("    MergeHistory {}: {:?}", label2, merge_history2);
+        }
+        println!("    KeePass history entries: {} has {}, {} has {}", label1, history_count1, label2, history_count2);
+    }
+    
+    // Always show history timestamps when verbose
+    if let Some(history1) = &entry1.history {
+        let mut times1: Vec<(std::time::SystemTime, String)> = history1.get_entries().iter()
+            .filter_map(|e| parse_modified_timestamp(e).map(|t| (t, format_timestamp(t))))
+            .collect();
+        times1.sort_by_key(|(time, _)| *time);
+        let sorted_times1: Vec<String> = times1.into_iter().map(|(_, formatted)| formatted).collect();
+        println!("    History timestamps {}: [{}]", label1, sorted_times1.join(", "));
+    }
+    if let Some(history2) = &entry2.history {
+        let mut times2: Vec<(std::time::SystemTime, String)> = history2.get_entries().iter()
+            .filter_map(|e| parse_modified_timestamp(e).map(|t| (t, format_timestamp(t))))
+            .collect();
+        times2.sort_by_key(|(time, _)| *time);
+        let sorted_times2: Vec<String> = times2.into_iter().map(|(_, formatted)| formatted).collect();
+        println!("    History timestamps {}: [{}]", label2, sorted_times2.join(", "));
     }
 }
 
@@ -803,9 +879,7 @@ fn get_yes_no_choice() -> bool {
     }
 }
 
-fn create_temp_db_copy(original_path: &str) -> Result<String, std::io::Error> {
-    let temp_path = format!("{}.tmp", original_path);
-    
+fn create_temp_db_copy(temp_path: &str, original_path: &str) -> Result<String, std::io::Error> {
     // Read the original file
     let mut original_file = File::open(original_path)?;
     let mut buffer = Vec::new();
@@ -816,7 +890,7 @@ fn create_temp_db_copy(original_path: &str) -> Result<String, std::io::Error> {
     temp_file.write_all(&buffer)?;
     temp_file.flush()?;
     
-    Ok(temp_path)
+    Ok(temp_path.to_string())
 }
 
 fn replace_original_with_temp(original_path: &str, temp_path: &str) -> Result<(), std::io::Error> {
@@ -851,6 +925,20 @@ fn format_duration(seconds: u64) -> (f64, &'static str) {
         ((seconds as f64) / 2592000.0, "M")
     } else {
         ((seconds as f64) / 31536000.0, "y")
+    }
+}
+
+fn add_entry_to_history(winning_entry: &mut Entry, losing_entry: &Entry, reason: &str) {
+    let history_field = winning_entry.fields.entry("MergeHistory".to_string()).or_insert_with(|| keepass::db::Value::Unprotected(String::new()));
+    if let keepass::db::Value::Unprotected(ref mut hist_str) = history_field {
+        if !hist_str.is_empty() {
+            hist_str.push('\n');
+        }
+        hist_str.push_str(&format!("{} at {}: Title={:?}, UserName={:?}",
+            reason,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            losing_entry.fields.get("Title"),
+            losing_entry.fields.get("UserName")));
     }
 }
 
@@ -929,10 +1017,46 @@ fn parse_modified_timestamp(entry: &Entry) -> Option<std::time::SystemTime> {
     }
 }
 
-fn resolve_conflict_by_timestamp<'a>(dest_entry: &'a Entry, source_entry: &'a Entry, threshold_seconds: u64) -> Option<&'static str> {
-    let dest_time = parse_modified_timestamp(dest_entry);
-    let source_time = parse_modified_timestamp(source_entry);
+fn collect_original_timestamps(
+    dest_root: &keepass::db::Group,
+    source_root: &keepass::db::Group,
+    timestamps: &mut std::collections::HashMap<String, (Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
+) {
+    fn collect_from_group(
+        group: &keepass::db::Group,
+        timestamps: &mut std::collections::HashMap<String, (Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
+        is_destination: bool,
+    ) {
+        for node in &group.children {
+            match node {
+                keepass::db::Node::Entry(e) => {
+                    let uuid = e.uuid.to_string();
+                    let time = get_modification_timestamp(e);
+                    let entry = timestamps.entry(uuid).or_insert((None, None));
+                    if is_destination {
+                        entry.0 = time;
+                    } else {
+                        entry.1 = time;
+                    }
+                }
+                keepass::db::Node::Group(g) => {
+                    collect_from_group(g, timestamps, is_destination);
+                }
+            }
+        }
+    }
     
+    collect_from_group(dest_root, timestamps, true);
+    collect_from_group(source_root, timestamps, false);
+}
+
+fn resolve_conflict_by_timestamp_entries<'a>(dest_entry: &'a Entry, source_entry: &'a Entry, threshold_seconds: u64) -> Option<&'static str> {
+    let dest_time = get_modification_timestamp(dest_entry);
+    let source_time = get_modification_timestamp(source_entry);
+    resolve_conflict_by_timestamp(dest_time, source_time, threshold_seconds)
+}
+
+fn resolve_conflict_by_timestamp(dest_time: Option<std::time::SystemTime>, source_time: Option<std::time::SystemTime>, threshold_seconds: u64) -> Option<&'static str> {
     match (dest_time, source_time) {
         (Some(dt), Some(st)) => {
             let duration = if dt > st {
@@ -953,4 +1077,68 @@ fn resolve_conflict_by_timestamp<'a>(dest_entry: &'a Entry, source_entry: &'a En
         }
         _ => None,
     }
+}
+
+fn get_modification_timestamp(entry: &Entry) -> Option<std::time::SystemTime> {
+    let current_time = parse_modified_timestamp(entry)?;
+    log::debug!("Analyzing entry {} for modification timestamp:", entry.uuid);
+    log::debug!("  Current LastModificationTime: {}", format_timestamp(current_time));
+
+    let history = entry.history.as_ref()?;
+    let history_entries = history.get_entries();
+    if history_entries.is_empty() {
+        log::debug!("  No history entries, using current time");
+        return Some(current_time);
+    }
+
+    // Get the latest history entry (most recent)
+    let latest_history = history_entries.iter().max_by_key(|e| parse_modified_timestamp(e))?;
+    let history_time = parse_modified_timestamp(latest_history)?;
+    log::debug!("  Latest history LastModificationTime: {}", format_timestamp(history_time));
+
+    // Compare key fields
+    let current_title = entry.fields.get("Title");
+    let current_username = entry.fields.get("UserName");
+    let current_url = entry.fields.get("URL");
+    let current_notes = entry.fields.get("Notes");
+    let current_password = entry.fields.get("Password");
+
+    let history_title = latest_history.fields.get("Title");
+    let history_username = latest_history.fields.get("UserName");
+    let history_url = latest_history.fields.get("URL");
+    let history_notes = latest_history.fields.get("Notes");
+    let history_password = latest_history.fields.get("Password");
+
+    let fields_match = current_title == history_title &&
+                      current_username == history_username &&
+                      current_url == history_url &&
+                      current_notes == history_notes &&
+                      current_password == history_password;
+
+    log::debug!("  Field comparison:");
+    log::debug!("    Title: current={:?}, history={:?} ({})", current_title, history_title, current_title == history_title);
+    log::debug!("    UserName: current={:?}, history={:?} ({})", current_username, history_username, current_username == history_username);
+    log::debug!("    URL: current={:?}, history={:?} ({})", current_url, history_url, current_url == history_url);
+    log::debug!("    Notes: current={:?}, history={:?} ({})", current_notes, history_notes, current_notes == history_notes);
+    log::debug!("    Password: current={:?}, history={:?} ({})", current_password, history_password, current_password == history_password);
+    log::debug!("  All fields match: {}", fields_match);
+
+    if fields_match && history_time > current_time {
+        log::debug!("  History has same fields but newer timestamp - using history time as correct modification time");
+        Some(history_time)
+    } else {
+        log::debug!("  Using current LastModificationTime as modification time");
+        Some(current_time)
+    }
+}
+
+fn count_entries(group: &keepass::db::Group) -> usize {
+    let mut count = 0;
+    for node in &group.children {
+        match node {
+            keepass::db::Node::Entry(_) => count += 1,
+            keepass::db::Node::Group(g) => count += count_entries(g),
+        }
+    }
+    count
 }
