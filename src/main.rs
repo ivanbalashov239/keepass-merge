@@ -603,7 +603,7 @@ fn get_user_choice_with_range(max_choice: u32) -> u32 {
 }
 
 fn get_yes_no_choice() -> bool {
-    use std::io::{self, Write};
+    use std::io::{self};
     
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
