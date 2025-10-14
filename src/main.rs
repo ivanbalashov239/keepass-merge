@@ -5,8 +5,9 @@ use anyhow::Result;
 use clap::Parser;
 use keepass::{db::{Entry, Group, Node}, ChallengeResponseKey, Database, DatabaseKey};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 use log;
+
+use keepass_merge::{get_modification_timestamp, parse_modified_timestamp, format_timestamp};
 
 /// Contact manager based on the KDBX4 encrypted database format
 #[derive(Parser)]
@@ -1065,18 +1066,6 @@ fn replace_original_with_temp(original_path: &str, temp_path: &str) -> Result<()
     Ok(())
 }
 
-fn format_timestamp(time: std::time::SystemTime) -> String {
-    if let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) {
-        if let Some(datetime) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
-            datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-        } else {
-            "<invalid timestamp>".to_string()
-        }
-    } else {
-        "<invalid timestamp>".to_string()
-    }
-}
-
 fn format_duration(seconds: u64) -> (f64, &'static str) {
     if seconds < 60 {
         (seconds as f64, "s")
@@ -1135,50 +1124,6 @@ fn parse_threshold(threshold_str: &str) -> Result<u64, String> {
         Ok(number * multiplier)
     } else {
         Err(format!("Invalid threshold format: {}. Expected format: <number>[<unit>], where unit can be s/m/h/d/M/y or second/minute/hour/day/month/year", threshold_str))
-    }
-}
-
-fn parse_modified_timestamp(entry: &Entry) -> Option<std::time::SystemTime> {
-    // First try to get the timestamp from the times field
-    if let Some(mod_time) = entry.times.times.get("LastModificationTime") {
-        // Convert NaiveDateTime to SystemTime
-        // KeePass stores times as local time, but we'll assume they're close enough to UTC for comparison
-        // Convert to UTC assuming the stored time is in UTC
-        let datetime_utc = DateTime::<Utc>::from_naive_utc_and_offset(*mod_time, Utc);
-        Some(datetime_utc.into())
-    } else {
-        // Fallback to fields (for backward compatibility or if times field is not populated)
-        let possible_fields = ["LastModificationTime", "Modified", "Times.LastModificationTime"];
-        
-        for field_name in &possible_fields {
-            if let Some(value) = entry.fields.get(*field_name) {
-                // Convert Value to string
-                let value_str: &str = match value {
-                    keepass::db::Value::Unprotected(s) => s,
-                    keepass::db::Value::Protected(p) => {
-                        std::str::from_utf8(p.unsecure()).unwrap_or("")
-                    },
-                    keepass::db::Value::Bytes(_) => continue, // Skip binary fields
-                };
-                
-                // Try parsing as Unix timestamp first
-                if let Ok(timestamp) = value_str.parse::<i64>() {
-                    if timestamp > 0 {
-                        return Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64));
-                    }
-                }
-                
-                // Try parsing as ISO 8601 datetime string
-                if let Ok(dt) = DateTime::parse_from_rfc3339(value_str) {
-                    return Some(dt.with_timezone(&Utc).into());
-                }
-                if let Ok(dt) = DateTime::parse_from_rfc2822(value_str) {
-                    return Some(dt.with_timezone(&Utc).into());
-                }
-            }
-        }
-        
-        None
     }
 }
 
@@ -1253,7 +1198,10 @@ fn resolve_conflict_by_timestamp(dest_time: Option<std::time::SystemTime>, sourc
             } else {
                 st.duration_since(dt).ok()?
             };
+            // verbose log showing duration comparison
             
+            log::debug!("Timestamp difference: {} seconds", duration.as_secs());
+            log::debug!("Threshold for automatic resolution: {} seconds", threshold_seconds);
             if duration.as_secs() >= threshold_seconds {
                 if dt > st {
                     Some("prefer-destination")
@@ -1265,59 +1213,6 @@ fn resolve_conflict_by_timestamp(dest_time: Option<std::time::SystemTime>, sourc
             }
         }
         _ => None,
-    }
-}
-
-fn get_modification_timestamp(entry: &Entry) -> Option<std::time::SystemTime> {
-    let current_time = parse_modified_timestamp(entry)?;
-    log::debug!("Analyzing entry {} for modification timestamp:", entry.uuid);
-    log::debug!("  Current LastModificationTime: {}", format_timestamp(current_time));
-
-    let history = entry.history.as_ref()?;
-    let history_entries = history.get_entries();
-    if history_entries.is_empty() {
-        log::debug!("  No history entries, using current time");
-        return Some(current_time);
-    }
-
-    // Get the latest history entry (most recent)
-    let latest_history = history_entries.iter().max_by_key(|e| parse_modified_timestamp(e))?;
-    let history_time = parse_modified_timestamp(latest_history)?;
-    log::debug!("  Latest history LastModificationTime: {}", format_timestamp(history_time));
-
-    // Compare key fields
-    let current_title = entry.fields.get("Title");
-    let current_username = entry.fields.get("UserName");
-    let current_url = entry.fields.get("URL");
-    let current_notes = entry.fields.get("Notes");
-    let current_password = entry.fields.get("Password");
-
-    let history_title = latest_history.fields.get("Title");
-    let history_username = latest_history.fields.get("UserName");
-    let history_url = latest_history.fields.get("URL");
-    let history_notes = latest_history.fields.get("Notes");
-    let history_password = latest_history.fields.get("Password");
-
-    let fields_match = current_title == history_title &&
-                      current_username == history_username &&
-                      current_url == history_url &&
-                      current_notes == history_notes &&
-                      current_password == history_password;
-
-    log::debug!("  Field comparison:");
-    log::debug!("    Title: current={:?}, history={:?} ({})", current_title, history_title, current_title == history_title);
-    log::debug!("    UserName: current={:?}, history={:?} ({})", current_username, history_username, current_username == history_username);
-    log::debug!("    URL: current={:?}, history={:?} ({})", current_url, history_url, current_url == history_url);
-    log::debug!("    Notes: current={:?}, history={:?} ({})", current_notes, history_notes, current_notes == history_notes);
-    log::debug!("    Password: current={:?}, history={:?} ({})", current_password, history_password, current_password == history_password);
-    log::debug!("  All fields match: {}", fields_match);
-
-    if fields_match && history_time > current_time {
-        log::debug!("  History has same fields but newer timestamp - using history time as correct modification time");
-        Some(history_time)
-    } else {
-        log::debug!("  Using current LastModificationTime as modification time");
-        Some(current_time)
     }
 }
 
