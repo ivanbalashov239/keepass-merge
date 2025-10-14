@@ -100,6 +100,6 @@ pub fn parse_modified_timestamp(entry: &Entry) -> Option<SystemTime> {
 }
 
 pub fn format_timestamp(timestamp: SystemTime) -> String {
-    let datetime = DateTime::<Utc>::try_from(timestamp).unwrap();
+    let datetime = DateTime::<Utc>::from(timestamp);
     datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }

@@ -5,7 +5,6 @@ use anyhow::Result;
 use clap::Parser;
 use keepass::{db::{Entry, Group, Node}, ChallengeResponseKey, Database, DatabaseKey};
 use uuid::Uuid;
-use log;
 
 use keepass_merge::{get_modification_timestamp, parse_modified_timestamp, format_timestamp};
 
@@ -347,8 +346,8 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
             auto_resolved_count = auto_resolved.len();
         }
         for (uuid, strategy) in &auto_resolved {
-            let dest_entry = find_entry_by_uuid(&destination_db.root, &uuid).cloned();
-            let source_entry = find_entry_by_uuid(&source_db.root, &uuid).cloned();
+            let dest_entry = find_entry_by_uuid(&destination_db.root, uuid).cloned();
+            let source_entry = find_entry_by_uuid(&source_db.root, uuid).cloned();
             
             if let (Some(dest_entry), Some(source_entry)) = (dest_entry, source_entry) {
                 // Show diff before resolution
@@ -360,7 +359,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                         // For prefer-destination, restore the original destination entry fields
                         // (the merge has already combined entries, so we need to undo that)
                         if let Some(original_dest_entry) = original_destination_entries.get(uuid) {
-                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
                                 // Restore the original fields, tags, etc.
                                 dest_entry_mut.fields = original_dest_entry.fields.clone();
                                 dest_entry_mut.tags = original_dest_entry.tags.clone();
@@ -383,14 +382,14 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                         }
                     }
                     "prefer-source" => {
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
                             add_entry_to_history(dest_entry_mut, &dest_entry, "Destination entry replaced");
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
                             println!("Entry {} resolved by timestamp: replaced with source version", uuid);
                             
                             // Show diff between final winning entry and losing entry
-                            if let Some(final_dest_entry) = find_entry_by_uuid(&destination_db.root, &uuid) {
+                            if let Some(final_dest_entry) = find_entry_by_uuid(&destination_db.root, uuid) {
                                 println!("\n--- Diff after resolution for entry {} ---", uuid);
                                 compare_entries(final_dest_entry, &dest_entry, "source (final)", "destination (lost)");
                             }
@@ -412,7 +411,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                     find_entry_by_uuid(&source_db.root, uuid)
                 ) {
                     if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
-                        add_entry_to_history(dest_entry_mut, &source_entry, "Source entry discarded");
+                        add_entry_to_history(dest_entry_mut, source_entry, "Source entry discarded");
                     }
                 }
             }
@@ -540,7 +539,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                         // For prefer-destination, restore the original destination entry fields
                         // (the merge has already combined entries, so we need to undo that)
                         if let Some(original_dest_entry) = original_destination_entries.get(uuid) {
-                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
                                 // Restore the original fields, tags, etc.
                                 dest_entry_mut.fields = original_dest_entry.fields.clone();
                                 dest_entry_mut.tags = original_dest_entry.tags.clone();
@@ -564,7 +563,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                     }
                     "prefer-source" => {
                         // Replace destination entry with source entry
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, uuid) {
                             add_entry_to_history(dest_entry_mut, &dest_entry, "Destination entry replaced");
                             dest_entry_mut.fields = source_entry.fields.clone();
                             dest_entry_mut.tags = source_entry.tags.clone();
@@ -731,7 +730,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
         return Ok(std::process::ExitCode::FAILURE);
     }
 
-    if merge_result.events.len() == 0 {
+    if merge_result.events.is_empty() {
         // Clean up any leftover temp files
         cleanup_temp_file();
         println!("Nothing to merge.");
@@ -824,7 +823,7 @@ fn find_entry_by_uuid_mut<'a>(group: &'a mut Group, uuid: &str) -> Option<&'a mu
     None
 }
 
-fn find_group_by_uuid<'a>(group: &'a Group, uuid: Uuid) -> Option<&'a Group> {
+fn find_group_by_uuid(group: &Group, uuid: Uuid) -> Option<&Group> {
     if group.uuid == uuid {
         return Some(group);
     }
@@ -901,7 +900,7 @@ fn compare_entries(entry1: &Entry, entry2: &Entry, label1: &str, label2: &str) {
                 (t2, t1, label2, label1)
             };
             
-            if let Some(duration) = newer.duration_since(older).ok() {
+            if let Ok(duration) = newer.duration_since(older) {
                 let secs = duration.as_secs();
                 let (value, unit) = format_duration(secs);
                 println!("    Difference: {} is {:.1}{} newer than {}", newer_label, value, unit, older_label);
@@ -1052,7 +1051,7 @@ fn create_temp_db_copy(temp_path: &str, original_path: &str) -> Result<String, s
     original_file.read_to_end(&mut buffer)?;
     
     // Write to temporary file
-    let mut temp_file = File::create(&temp_path)?;
+    let mut temp_file = File::create(temp_path)?;
     temp_file.write_all(&buffer)?;
     temp_file.flush()?;
     
@@ -1310,13 +1309,11 @@ fn main() -> Result<std::process::ExitCode> {
         // Clean up any temp files that match the pattern
         let destination_path = std::path::Path::new(&destination_db_for_cleanup_clone);
         if let Ok(entries) = std::fs::read_dir(destination_path.parent().unwrap_or(std::path::Path::new("."))) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        if file_name.starts_with(".tmpkdbx.") && file_name.contains(&destination_path.file_name().unwrap().to_string_lossy().to_string()) {
-                            let _ = std::fs::remove_file(entry.path());
-                            eprintln!("\nTemporary file {} cleaned up.", entry.path().display());
-                        }
+            for entry in entries.flatten() {
+                if let Some(file_name) = entry.file_name().to_str() {
+                    if file_name.starts_with(".tmpkdbx.") && file_name.contains(&destination_path.file_name().unwrap().to_string_lossy().to_string()) {
+                        let _ = std::fs::remove_file(entry.path());
+                        eprintln!("\nTemporary file {} cleaned up.", entry.path().display());
                     }
                 }
             }
