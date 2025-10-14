@@ -1,14 +1,17 @@
 ---
-name: Merge on Main
+name: CI
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
-    name: cargo build
+    name: cargo build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -19,3 +22,15 @@ jobs:
           override: true
       - name: run cargo build
         run: cargo build
+      - name: run cargo test
+        run: cargo test
+  nix-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: cachix/install-nix-action@v20
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: run nix flake check
+        run: nix flake check
