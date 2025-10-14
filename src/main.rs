@@ -24,13 +24,13 @@ struct KeepassMerge {
     #[clap(long, short)]
     no_password: bool,
 
-    /// Password for the destination database (for testing)
+    /// Password for the destination database (for testing). Use "-" to read from stdin.
     #[clap(long)]
     password: Option<String>,
 
-    /// Password for the source database (for testing)
+    /// Password for the source database (for testing). Use "-" to read from stdin.
     #[clap(long)]
-    password_from: Option<String>,
+    source_password: Option<String>,
 
     /// Use the same credentials for both databases.
     #[clap(long, short)]
@@ -58,7 +58,7 @@ struct KeepassMerge {
 
     /// Do not use a password to decrypt the source database
     #[clap(long)]
-    no_password_from: bool,
+    no_source_password: bool,
 
     /// Force saving the database even if warnings were generated.
     #[clap(long, short)]
@@ -99,6 +99,18 @@ struct KeepassMerge {
     /// Ignore threshold comparisons and use other merge strategies.
     #[clap(long)]
     ignore_threshold: bool,
+}
+
+/// Read password from stdin if password argument is "-", otherwise return the password as-is
+fn resolve_password(password_arg: &str) -> Result<String> {
+    if password_arg == "-" {
+        let mut buffer = String::new();
+        std::io::stdin().read_line(&mut buffer)?;
+        // Remove trailing newline if present
+        Ok(buffer.trim_end().to_string())
+    } else {
+        Ok(password_arg.to_string())
+    }
 }
 
 fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<std::process::ExitCode> {
@@ -153,9 +165,9 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
 
     if !args.no_password {
         let destination_db_password = if let Some(ref pwd) = args.password {
-            pwd.clone()
+            resolve_password(pwd)?
         } else {
-            // This should not happen since we prompt in main(), but fallback just in case
+            // Fallback to interactive prompt if no password provided
             rpassword::prompt_password("Password for the destination database: ")
                 .expect("Could not read password from TTY")
         };
@@ -171,27 +183,40 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
     }
 
     if destination_db_key.is_empty() {
+        cleanup_temp_file();
         return Err(anyhow::format_err!(
             "No database key was provided for destination database."
         ));
     }
 
     println!("Opening the destination database.");
-    let mut destination_db = Database::open(&mut destination_db_file, destination_db_key.clone())?;
+    let mut destination_db = match Database::open(&mut destination_db_file, destination_db_key.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            cleanup_temp_file();
+            return Err(e.into());
+        }
+    };
 
     let mut source_db = match args.same_credentials {
         true => {
             println!("Opening the source database.");
-            Database::open(&mut source_db_file, destination_db_key.clone())
+            match Database::open(&mut source_db_file, destination_db_key.clone()) {
+                Ok(db) => db,
+                Err(e) => {
+                    cleanup_temp_file();
+                    return Err(e.into());
+                }
+            }
         }
         false => {
             let mut source_db_key = DatabaseKey::new();
 
-            if !args.no_password_from {
-                let source_db_password = if let Some(ref pwd) = args.password_from {
-                    pwd.clone()
+            if !args.no_source_password {
+                let source_db_password = if let Some(ref pwd) = args.source_password {
+                    resolve_password(pwd)?
                 } else if args.same_credentials {
-                    // Use the same password as destination (already prompted in main)
+                    // Use the same password as destination (already resolved)
                     args.password.as_ref().unwrap().clone()
                 } else {
                     rpassword::prompt_password("Password for the source database: ")
@@ -210,15 +235,22 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
             }
 
             if source_db_key.is_empty() {
+                cleanup_temp_file();
                 return Err(anyhow::format_err!(
                     "No database key was provided for source database."
                 ));
             }
 
             println!("Opening the source database.");
-            Database::open(&mut source_db_file, source_db_key)
+            match Database::open(&mut source_db_file, source_db_key) {
+                Ok(db) => db,
+                Err(e) => {
+                    cleanup_temp_file();
+                    return Err(e.into());
+                }
+            }
         }
-    }?;
+    };
 
     if args.verbose > 0 {
         let dest_count = count_entries(&destination_db.root);
@@ -231,8 +263,13 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
     let mut original_timestamps = std::collections::HashMap::new();
     collect_original_timestamps(&destination_db.root, &source_db.root, &mut original_timestamps);
     
+    // For conflict resolution strategies that need original entries, collect them
+    let mut original_destination_entries = std::collections::HashMap::new();
+    collect_original_entries(&destination_db.root, &source_db.root, &mut original_destination_entries);
+    
     if args.verbose > 0 {
         println!("Analyzed {} entries for timestamp information.", original_timestamps.len());
+        println!("Backed up {} destination entries for conflict resolution.", original_destination_entries.len());
     }
     
     let merge_result = match destination_db.merge(&source_db) {
@@ -252,11 +289,13 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                     Ok(r) => r,
                     Err(e2) => {
                         eprintln!("Merge failed even after fixing timestamps: {}", e2);
+                        cleanup_temp_file();
                         return Ok(std::process::ExitCode::FAILURE);
                     }
                 }
             } else {
                 eprintln!("{}", e);
+                cleanup_temp_file();
                 return Ok(std::process::ExitCode::FAILURE);
             }
         }
@@ -317,16 +356,29 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                 
                 match *strategy {
                     "prefer-destination" => {
-                        // Add source entry to destination entry's history
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            add_entry_to_history(dest_entry_mut, &source_entry, "Source entry merged");
-                        }
-                        println!("Entry {} resolved by timestamp: keeping destination version", uuid);
-                        
-                        // Show diff between final winning entry and losing entry
-                        if let Some(final_dest_entry) = find_entry_by_uuid(&destination_db.root, &uuid) {
-                            println!("\n--- Diff after resolution for entry {} ---", uuid);
-                            compare_entries(final_dest_entry, &source_entry, "destination (final)", "source (lost)");
+                        // For prefer-destination, restore the original destination entry fields
+                        // (the merge has already combined entries, so we need to undo that)
+                        if let Some(original_dest_entry) = original_destination_entries.get(uuid) {
+                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                                // Restore the original fields, tags, etc.
+                                dest_entry_mut.fields = original_dest_entry.fields.clone();
+                                dest_entry_mut.tags = original_dest_entry.tags.clone();
+                                dest_entry_mut.autotype = original_dest_entry.autotype.clone();
+                                dest_entry_mut.times = original_dest_entry.times.clone();
+                                dest_entry_mut.custom_data = original_dest_entry.custom_data.clone();
+                                dest_entry_mut.icon_id = original_dest_entry.icon_id;
+                                dest_entry_mut.custom_icon_uuid = original_dest_entry.custom_icon_uuid;
+                                dest_entry_mut.foreground_color = original_dest_entry.foreground_color.clone();
+                                dest_entry_mut.background_color = original_dest_entry.background_color.clone();
+                                dest_entry_mut.override_url = original_dest_entry.override_url.clone();
+                                dest_entry_mut.quality_check = original_dest_entry.quality_check;
+                                dest_entry_mut.history = original_dest_entry.history.clone();
+                                println!("Keeping destination version for entry {}", uuid);
+                            } else {
+                                println!("Warning: Could not find entry {} to restore original version", uuid);
+                            }
+                        } else {
+                            println!("Warning: No original destination entry found for {}", uuid);
                         }
                     }
                     "prefer-source" => {
@@ -386,44 +438,57 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                 }
             }
             
-            println!("\nChoose how to resolve {} remaining conflicting entries:", still_conflicting.len());
-            println!("1. Keep destination versions (discard source changes)");
-            println!("2. Keep source versions (overwrite destination)");
-            println!("3. Keep both versions (create duplicates)");
-            println!("4. Skip all conflicts (remove conflicting entries)");
-            println!("5. Cancel merge (don't save)");
-            
-            if !args.ignore_threshold {
-                println!("\nNote: Entries with significantly different modification times (>={}s) were already resolved automatically.", args.threshold);
-            }
-            
-            let choice = get_user_choice_with_range(5);
-            match choice {
-                1 => {
-                    args.prefer_destination = true;
-                    println!("Applying: Keep destination versions");
+            if args.interactive {
+                println!("\nChoose how to resolve {} remaining conflicting entries:", still_conflicting.len());
+                println!("1. Keep destination versions (discard source changes)");
+                println!("2. Keep source versions (overwrite destination)");
+                println!("3. Keep both versions (create duplicates)");
+                println!("4. Skip all conflicts (remove conflicting entries)");
+                println!("5. Cancel merge (don't save)");
+                
+                if !args.ignore_threshold {
+                    println!("\nNote: Entries with significantly different modification times (>={}s) were already resolved automatically.", args.threshold);
                 }
-                2 => {
-                    args.prefer_source = true;
-                    println!("Applying: Keep source versions");
+                
+                let choice = get_user_choice_with_range(5);
+                match choice {
+                    1 => {
+                        args.prefer_destination = true;
+                        println!("Applying: Keep destination versions");
+                    }
+                    2 => {
+                        args.prefer_source = true;
+                        println!("Applying: Keep source versions");
+                    }
+                    3 => {
+                        args.keep_both = true;
+                        println!("Applying: Keep both versions");
+                    }
+                    4 => {
+                        args.skip_conflicts = true;
+                        println!("Applying: Skip all conflicts");
+                    }
+                    5 => {
+                        println!("Merge cancelled by user.");
+                        // Clean up temp file
+                        cleanup_temp_file();
+                        return Ok(std::process::ExitCode::SUCCESS);
+                    }
+                    _ => {
+                        println!("Invalid choice, using default: Keep both versions");
+                        args.keep_both = true;
+                    }
                 }
-                3 => {
+            } else {
+                // In non-interactive mode
+                if args.force {
+                    println!("Proceeding with default conflict resolution (keep both versions) due to --force.");
                     args.keep_both = true;
-                    println!("Applying: Keep both versions");
-                }
-                4 => {
-                    args.skip_conflicts = true;
-                    println!("Applying: Skip all conflicts");
-                }
-                5 => {
-                    println!("Merge cancelled by user.");
-                    // Clean up temp file
+                } else {
+                    eprintln!("{} entries still have conflicts and require manual resolution.", still_conflicting.len());
+                    eprintln!("Use --prefer-destination, --prefer-source, --keep-both, --skip-conflicts, -i (interactive), or --force.");
                     cleanup_temp_file();
-                    return Ok(std::process::ExitCode::SUCCESS);
-                }
-                _ => {
-                    println!("Invalid choice, using default: Keep both versions");
-                    args.keep_both = true;
+                    return Ok(std::process::ExitCode::FAILURE);
                 }
             }
         } else {
@@ -471,11 +536,30 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
 
                 match effective_strategy {
                     "prefer-destination" => {
-                        // Add source entry to destination entry's history
-                        if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
-                            add_entry_to_history(dest_entry_mut, &source_entry, "Source entry merged");
+                        // For prefer-destination, restore the original destination entry fields
+                        // (the merge has already combined entries, so we need to undo that)
+                        if let Some(original_dest_entry) = original_destination_entries.get(uuid) {
+                            if let Some(dest_entry_mut) = find_entry_by_uuid_mut(&mut destination_db.root, &uuid) {
+                                // Restore the original fields, tags, etc.
+                                dest_entry_mut.fields = original_dest_entry.fields.clone();
+                                dest_entry_mut.tags = original_dest_entry.tags.clone();
+                                dest_entry_mut.autotype = original_dest_entry.autotype.clone();
+                                dest_entry_mut.times = original_dest_entry.times.clone();
+                                dest_entry_mut.custom_data = original_dest_entry.custom_data.clone();
+                                dest_entry_mut.icon_id = original_dest_entry.icon_id;
+                                dest_entry_mut.custom_icon_uuid = original_dest_entry.custom_icon_uuid;
+                                dest_entry_mut.foreground_color = original_dest_entry.foreground_color.clone();
+                                dest_entry_mut.background_color = original_dest_entry.background_color.clone();
+                                dest_entry_mut.override_url = original_dest_entry.override_url.clone();
+                                dest_entry_mut.quality_check = original_dest_entry.quality_check;
+                                dest_entry_mut.history = original_dest_entry.history.clone();
+                                println!("Keeping destination version for entry {}", uuid);
+                            } else {
+                                println!("Warning: Could not find entry {} to restore original version", uuid);
+                            }
+                        } else {
+                            println!("Warning: No original destination entry found for {}", uuid);
                         }
-                        println!("Keeping destination version for entry {}", uuid);
                     }
                     "prefer-source" => {
                         // Replace destination entry with source entry
@@ -488,12 +572,47 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                         }
                     }
                     "keep-both" => {
-                        // Clone the source entry with a new UUID and add it
-                        let mut cloned_entry = source_entry.clone();
-                        cloned_entry.uuid = Uuid::new_v4();
-                        // Add to the root group for simplicity
-                        destination_db.root.children.push(keepass::db::Node::Entry(cloned_entry));
-                        println!("Added cloned source entry for {} with new UUID", uuid);
+                        // For keep-both, find and remove the current entry from root,
+                        // add the original destination entry, and add the source entry as a new entry
+                        if let Some(original_dest_entry) = original_destination_entries.get(uuid) {
+                            // Find the index of the current entry in root children
+                            let mut entry_index = None;
+                            for (index, node) in destination_db.root.children.iter().enumerate() {
+                                if let keepass::db::Node::Entry(e) = node {
+                                    if e.uuid.to_string() == *uuid {
+                                        entry_index = Some(index);
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if let Some(index) = entry_index {
+                                // Remove the current entry
+                                destination_db.root.children.remove(index);
+                                
+                                // Add the original destination entry
+                                destination_db.root.children.push(keepass::db::Node::Entry(original_dest_entry.clone()));
+                                
+                                // Add the source entry as a new entry
+                                let mut cloned_entry = source_entry.clone();
+                                cloned_entry.uuid = Uuid::new_v4();
+                                destination_db.root.children.push(keepass::db::Node::Entry(cloned_entry));
+                                
+                                println!("Replaced entry {} with original and added cloned source", uuid);
+                            } else {
+                                // Fallback: just add the source entry
+                                let mut cloned_entry = source_entry.clone();
+                                cloned_entry.uuid = Uuid::new_v4();
+                                destination_db.root.children.push(keepass::db::Node::Entry(cloned_entry));
+                                println!("Added cloned source entry for {} with new UUID", uuid);
+                            }
+                        } else {
+                            // Fallback: just add the source entry
+                            let mut cloned_entry = source_entry.clone();
+                            cloned_entry.uuid = Uuid::new_v4();
+                            destination_db.root.children.push(keepass::db::Node::Entry(cloned_entry));
+                            println!("Added cloned source entry for {} with new UUID", uuid);
+                        }
                     }
                     "skip-conflicts" => {
                         // Remove the conflicting entry that was added by merge
@@ -866,14 +985,34 @@ fn get_user_choice() -> u32 {
 }
 
 fn get_user_choice_with_range(max_choice: u32) -> u32 {
-    use std::io::{self, Write};
+    use std::io::{self, Write, BufRead};
     
     loop {
         print!("Enter your choice (1-{}): ", max_choice);
         io::stdout().flush().unwrap();
         
         let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
+        
+        // Try to read from /dev/tty if available (for interactive input even when stdin is piped)
+        let read_result = if atty::is(atty::Stream::Stdin) {
+            // Stdin is a TTY, read from stdin
+            io::stdin().read_line(&mut input)
+        } else {
+            // Stdin is piped, try to read from /dev/tty for interactive input
+            match std::fs::File::open("/dev/tty") {
+                Ok(mut tty) => {
+                    let mut reader = io::BufReader::new(&mut tty);
+                    reader.read_line(&mut input)
+                }
+                Err(_) => {
+                    // /dev/tty not available, use default
+                    println!("Using default choice (3) since interactive input is not available.");
+                    return 3;
+                }
+            }
+        };
+        
+        match read_result {
             Ok(_) => {
                 let trimmed = input.trim();
                 if trimmed.is_empty() && max_choice >= 3 {
@@ -1074,6 +1213,30 @@ fn collect_original_timestamps(
     
     collect_from_group(dest_root, timestamps, true);
     collect_from_group(source_root, timestamps, false);
+}
+
+fn collect_original_entries(
+    dest_root: &keepass::db::Group,
+    _source_root: &keepass::db::Group,
+    original_entries: &mut std::collections::HashMap<String, Entry>,
+) {
+    fn collect_from_group(
+        group: &keepass::db::Group,
+        original_entries: &mut std::collections::HashMap<String, Entry>,
+    ) {
+        for node in &group.children {
+            match node {
+                keepass::db::Node::Entry(e) => {
+                    original_entries.insert(e.uuid.to_string(), e.clone());
+                }
+                keepass::db::Node::Group(g) => {
+                    collect_from_group(g, original_entries);
+                }
+            }
+        }
+    }
+    
+    collect_from_group(dest_root, original_entries);
 }
 
 fn resolve_conflict_by_timestamp_entries<'a>(dest_entry: &'a Entry, source_entry: &'a Entry, threshold_seconds: u64) -> Option<&'static str> {
@@ -1277,6 +1440,24 @@ fn main() -> Result<std::process::ExitCode> {
         let password = rpassword::prompt_password("Password for the databases: ")
             .expect("Could not read password from TTY");
         args.password = Some(password);
+    }
+
+    // If password is "-", read from stdin
+    if let Some(pwd) = &args.password {
+        if pwd == "-" {
+            let password = resolve_password(pwd)
+                .expect("Could not read password from stdin");
+            args.password = Some(password);
+        }
+    }
+
+    // If source_password is "-", read from stdin
+    if let Some(pwd) = &args.source_password {
+        if pwd == "-" {
+            let password = resolve_password(pwd)
+                .expect("Could not read password from stdin");
+            args.source_password = Some(password);
+        }
     }
 
     // If not using same credentials and no destination password provided, prompt for destination
