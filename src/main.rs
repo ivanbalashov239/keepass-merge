@@ -472,7 +472,7 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                         println!("Merge cancelled by user.");
                         // Clean up temp file
                         cleanup_temp_file();
-                        return Ok(std::process::ExitCode::SUCCESS);
+                        return Ok(std::process::ExitCode::FAILURE);
                     }
                     _ => {
                         println!("Invalid choice, using default: Keep both versions");
@@ -1469,6 +1469,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     // Iterate through all source databases
     let source_paths: Vec<String> = args.source_db.clone();
+    let mut any_merge_failed = false;
     for (index, source_path) in source_paths.iter().enumerate() {
         println!("Merging source database {} of {}: {}", index + 1, source_paths.len(), source_path);
 
@@ -1478,9 +1479,14 @@ fn main() -> Result<std::process::ExitCode> {
         // For now, let's continue with other sources even if one fails
         if result != std::process::ExitCode::SUCCESS {
             eprintln!("Warning: Failed to merge source database: {}", source_path);
+            any_merge_failed = true;
         }
     }
 
     println!("All source databases have been processed.");
-    Ok(std::process::ExitCode::SUCCESS)
+    if any_merge_failed {
+        Ok(std::process::ExitCode::FAILURE)
+    } else {
+        Ok(std::process::ExitCode::SUCCESS)
+    }
 }
