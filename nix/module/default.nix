@@ -136,12 +136,12 @@ in
               Environment = [
                 "DISPLAY=:0"
                 "XAUTHORITY=/home/${cfg.guiUser}/.Xauthority"
-              ] ++ (optional (cfg.pattern != null) "CONFLICT_PATTERN=${cfg.pattern}")
-              ++ (optional (cfg.guiCommand != null) "KEEPASS_MERGE_GUI=${cfg.guiCommand}")
-              ++ (optional cfg.moveOnRemoval "KEEPASS_MOVE_ON_REMOVAL=true")
-              ++ (optional (cfg.extraArgs != "") "KEEPASS_MERGE_EXTRAARGS=${cfg.extraArgs}")
-              ++ (optional (c.passwordFile != null) "KEEPASS_PASSWORD_FILE=${toString c.passwordFile}");
-              ExecStart = "${merge_script}/bin/merge_keepass ${toString c.path}";
+              ] ++ (optional (cfg.pattern != null) "CONFLICT_PATTERN=${cfg.pattern}");
+              ExecStart = "${merge_script}/bin/merge_keepass ${toString c.path}"
+                + (optionalString (cfg.guiCommand != null) " --gui_command ${cfg.guiCommand}")
+                + (optionalString (c.passwordFile != null) " --pass_file ${toString c.passwordFile}")
+                + (optionalString cfg.moveOnRemoval " --move_on_removal")
+                + (optionalString (cfg.extraArgs != "") " ${cfg.extraArgs}");
             };
           };
         })
