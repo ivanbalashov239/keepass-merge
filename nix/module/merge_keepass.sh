@@ -123,7 +123,7 @@ for original_file in "${!original_files_map[@]}"; do
         if [ "$(id -u)" -eq 0 ]; then
             cmd="sudo -u \"$user_of_original_file\" $cmd"
         fi
-        if [ -n "$KEEPASS_PASSWORD_FILE" ] && [ -f "$KEEPASS_PASSWORD_FILE" ]; then
+        if [ -v KEEPASS_PASSWORD_FILE ] && [ -n "$KEEPASS_PASSWORD_FILE" ] && [ -f "$KEEPASS_PASSWORD_FILE" ]; then
             cmd="cat $KEEPASS_PASSWORD_FILE | $cmd"
         fi
         first_conflict_file="${conflict_files_for_original[0]}"
@@ -141,13 +141,13 @@ for original_file in "${!original_files_map[@]}"; do
         else
             # Create conflict directory if it doesn't exist
             make_dir_function
-            if [ "$KEEPASS_MOVE_ON_REMOVAL" = true ]; then
+            if [ "${KEEPASS_MOVE_ON_REMOVAL:-false}" = true ]; then
                             remove_cmd="sudo -u \"$user_of_original_file\" mkdir -p $conflict_dir && sudo -u \"$user_of_original_file\" mv -v ${conflict_files_for_original[*]} $conflict_dir/"
             else
                 remove_cmd="rm -v ${conflict_files_for_original[*]}"
             fi
         fi
-        if [ "$KEEPASS_MOVE_ON_REMOVAL" = true ]; then
+        if [ "${KEEPASS_MOVE_ON_REMOVAL:-false}" = true ]; then
             # Create conflict directory if it doesn't exist
             make_dir_function
             #copy original file to conflict dir before merging

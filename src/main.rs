@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use anyhow::Result;
+use atty;
 use clap::Parser;
 use keepass::{db::{Entry, Group, Node}, ChallengeResponseKey, Database, DatabaseKey};
 use uuid::Uuid;
@@ -136,6 +137,11 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
             "Cannot use both interactive mode (-i) and automatic merge strategies"
         ));
     }
+    if args.interactive && !atty::is(atty::Stream::Stdin) {
+        return Err(anyhow::format_err!(
+            "Interactive mode requires a TTY. Please use automatic merge strategies (--prefer-destination, --prefer-source, --keep-both, --skip-conflicts) or --force."
+        ));
+    }
 
     let destination_db_path = args.destination_db.clone();
     let source_db_path = source_db_path.to_string();
@@ -168,6 +174,9 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
             resolve_password(pwd)?
         } else {
             // Fallback to interactive prompt if no password provided
+            if !atty::is(atty::Stream::Stdin) {
+                return Err(anyhow::format_err!("Password required but no TTY available. Please provide password via --password argument."));
+            }
             rpassword::prompt_password("Password for the destination database: ")
                 .expect("Could not read password from TTY")
         };
@@ -219,6 +228,9 @@ fn merge_single_source(args: &mut KeepassMerge, source_db_path: &str) -> Result<
                     // Use the same password as destination (already resolved)
                     args.password.as_ref().unwrap().clone()
                 } else {
+                    if !atty::is(atty::Stream::Stdin) {
+                        return Err(anyhow::format_err!("Password required but no TTY available. Please provide password via --source-password argument."));
+                    }
                     rpassword::prompt_password("Password for the source database: ")
                         .expect("Could not read password from TTY")
                 };
@@ -1329,6 +1341,10 @@ fn main() -> Result<std::process::ExitCode> {
 
     // If using same credentials and no password provided, prompt once for all databases
     if args.same_credentials && args.password.is_none() && !args.no_password {
+        if !atty::is(atty::Stream::Stdin) {
+            eprintln!("Error: Password required but no TTY available. Please provide password via --password argument.");
+            return Ok(std::process::ExitCode::FAILURE);
+        }
         let password = rpassword::prompt_password("Password for the databases: ")
             .expect("Could not read password from TTY");
         args.password = Some(password);
@@ -1354,6 +1370,10 @@ fn main() -> Result<std::process::ExitCode> {
 
     // If not using same credentials and no destination password provided, prompt for destination
     if !args.same_credentials && args.password.is_none() && !args.no_password {
+        if !atty::is(atty::Stream::Stdin) {
+            eprintln!("Error: Password required but no TTY available. Please provide password via --password argument.");
+            return Ok(std::process::ExitCode::FAILURE);
+        }
         let password = rpassword::prompt_password("Password for the destination database: ")
             .expect("Could not read password from TTY");
         args.password = Some(password);

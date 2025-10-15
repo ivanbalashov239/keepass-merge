@@ -2,6 +2,7 @@
 use std::fs::File;
 
 use anyhow::Result;
+use atty;
 use clap::Parser;
 use keepass::{Database, DatabaseKey};
 
@@ -26,8 +27,13 @@ fn main() -> Result<std::process::ExitCode> {
         key = key.with_keyfile(&mut File::open(f)?)?;
     }
 
-    let password = rpassword::prompt_password("Password (or blank for none): ")
-        .expect("Could not read password from TTY");
+    let password = if atty::is(atty::Stream::Stdin) {
+        rpassword::prompt_password("Password (or blank for none): ")
+            .expect("Could not read password from TTY")
+    } else {
+        eprintln!("Error: Password required but no TTY available. Please run in interactive terminal.");
+        return Ok(std::process::ExitCode::FAILURE);
+    };
 
     key = key.with_password(&password);
 
