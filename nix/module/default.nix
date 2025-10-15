@@ -125,7 +125,6 @@ in
       partOf = [ "multi-user.target" ];
       serviceConfig = {
         User = cfg.user;
-        Path = with pkgs; [ inotify-tools ];
         ExecStart =
           let
             monitorScript = pkgs.writeScript "keepass-monitor" ''
