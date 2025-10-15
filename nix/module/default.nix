@@ -136,7 +136,6 @@ in
               Environment = [
                 "DISPLAY=:0"
                 "XAUTHORITY=/home/${cfg.guiUser}/.Xauthority"
-                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u ${cfg.guiUser})/bus"
               ] ++ (optional (cfg.pattern != null) "CONFLICT_PATTERN=${cfg.pattern}")
               ++ (optional (cfg.guiCommand != null) "KEEPASS_MERGE_GUI=${cfg.guiCommand}")
               ++ (optional cfg.moveOnRemoval "KEEPASS_MOVE_ON_REMOVAL=true")
