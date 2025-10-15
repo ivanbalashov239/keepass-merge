@@ -13,14 +13,14 @@ in
 
     configs = mkOption {
       type = types.listOf (types.submodule {
-        options = {
+        options = rec {
           path = mkOption {
             type = types.path;
             description = "Directory to monitor for sync conflict files";
           };
           name = mkOption {
             type = types.str;
-            default = replaceStrings [ "/" ] [ "_" ] (toString config.path);
+            default = replaceStrings [ "/" ] [ "_" ] (toString path);
             description = "Name for the systemd service, defaults to path with slashes replaced by underscores";
           };
           passwordFile = mkOption {
