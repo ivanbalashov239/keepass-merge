@@ -48,28 +48,24 @@
       in
       {
         nixosModules = {
-          keepassMerge = ./nix/module/default.nix;
+          keepassMerge = { pkgs, ... }: {
+            imports = [ ./nix/module/default.nix ];
+            nixpkgs.overlays = [ self.overlays.default ];
+          };
           default = self.nixosModules.keepassMerge;
         };
 
         overlays = {
           default = final: prev: {
-            keepass-merge = buildKeepassMerge {
-              rustPlatform = final.makeRustPlatform {
-                rustc = final.rust-bin.stable.latest.default;
-                cargo = final.rust-bin.stable.latest.default;
-              };
-              lib = final.lib;
-              src = ./.; # Project root
-            };
-            keepass-merge-script = import ./nix/module/script.nix { keepass-merge = final.keepass-merge; inherit (final) sudo coreutils writeShellApplication; inherit (final) lib; };
+            keepass-merge = self.packages.${final.system}.default;
+            keepass-merge-script = self.packages.${final.system}.script;
           };
         };
       } // flake-utils.lib.eachDefaultSystem (
         system: (
           let
             projectName = "keepass-merge";
-            overlays = [ rust-overlay.overlays.default ];
+            overlays = [ rust-overlay.overlays.default self.overlays.default ];
             pkgs = import nixpkgs {
               inherit system overlays;
             };

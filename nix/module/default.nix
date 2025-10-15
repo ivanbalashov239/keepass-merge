@@ -4,7 +4,7 @@ with lib;
 
 let
   cfg = config.services.keepassMerge;
-  keepass-merge = pkgs.keepass-merge or pkgs.callPackage ../../nix/default.nix { };
+  keepass-merge = pkgs.keepass-merge;
   merge_script = import ./script.nix { inherit keepass-merge; inherit (pkgs) sudo coreutils writeShellApplication; inherit lib; };
 in
 {
