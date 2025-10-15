@@ -162,7 +162,7 @@ for original_file in "${!original_files_map[@]}"; do
         # Execute keepass-merge
         if ! eval "$cmd"; then
             echo "Non-interactive merge failed for $original_file, launching interactive mode."
-            if [ -n "$KEEPASS_MERGE_GUI" ]; then
+            if [ -v KEEPASS_MERGE_GUI ] && [ -n "$KEEPASS_MERGE_GUI" ]; then
                 echo "Launching GUI mode"
                 $KEEPASS_MERGE_GUI "bash -c '$cmd -i'" && eval "$remove_cmd"
             else
