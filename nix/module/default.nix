@@ -102,7 +102,7 @@ in
           let
             startScript = pkgs.writeScript "start-merge" ''
               #!/bin/bash
-              DIR="$1"
+              DIR=$(${pkgs.systemd}/bin/systemd-escape -u "$1")
               ${lib.concatStringsSep "\n" (map (c: ''
                 if [ "$DIR" = "${toString c.path}" ]; then
                   ${if c.passwordFile != null then ''export KEEPASS_PASSWORD_FILE="${toString c.passwordFile}"'' else ""}
@@ -134,7 +134,8 @@ in
               ${pkgs.inotify-tools}/bin/inotifywait -m -r -e create ${lib.concatStringsSep " " (map (c: toString c.path) cfg.configs)} |
               while read -r dir action file; do
                 echo "Detected new file: $dir/$file"
-                systemctl start keepass-merge@"$dir" --no-block || echo "Failed to start merge service for $dir"
+                dir_instance=$(${pkgs.systemd}/bin/systemd-escape "$dir")
+                systemctl start "keepass-merge@$dir_instance" --no-block || echo "Failed to start merge service for $dir"
               done
             '';
           in
