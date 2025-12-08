@@ -3,14 +3,10 @@
 
   inputs = {
     nixpkgs = {
-      url = "github:NixOS/nixpkgs";
+      url = "github:NixOS/nixpkgs/nixos-25.11";
     };
     flake-utils = {
       url = "github:numtide/flake-utils";
-    };
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
@@ -18,7 +14,6 @@
     { self
     , nixpkgs
     , flake-utils
-    , rust-overlay
     ,
     }: (
       let
@@ -65,21 +60,15 @@
         system: (
           let
             projectName = "keepass-merge";
-            overlays = [ rust-overlay.overlays.default self.overlays.default ];
+            overlays = [ self.overlays.default ];
             pkgs = import nixpkgs {
               inherit system overlays;
             };
-
-            rustToolchain = pkgs.rust-bin.stable.latest.default;
-
-            cargoPackages = [
-              rustToolchain
-            ];
           in
           {
             devShells = {
               default = pkgs.mkShell {
-                buildInputs = cargoPackages ++ [ pkgs.shellcheck pkgs.nixpkgs-fmt pkgs.sudo pkgs.coreutils ];
+                buildInputs = [ pkgs.rustc pkgs.cargo ] ++ [ pkgs.shellcheck pkgs.nixpkgs-fmt pkgs.sudo pkgs.coreutils ];
 
                 shellHook = ''
                   export RUSTFLAGS='-C target-cpu=native'
@@ -90,8 +79,8 @@
               let
                 inherit (pkgs) lib;
                 rustPlatform = pkgs.makeRustPlatform {
-                  rustc = rustToolchain;
-                  cargo = rustToolchain;
+                  rustc = pkgs.rustc;
+                  cargo = pkgs.cargo;
                 };
                 keepass-merge-pkg = buildKeepassMerge {
                   inherit rustPlatform lib;
